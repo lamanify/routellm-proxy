@@ -1,0 +1,182 @@
+[
+  {
+    "prompt": "yo drop the url for staging",
+    "expected": "routine"
+  },
+  {
+    "prompt": "what time is it in London?",
+    "expected": "routine"
+  },
+  {
+    "prompt": "ping",
+    "expected": "routine"
+  },
+  {
+    "prompt": "check if server is reachable",
+    "expected": "routine"
+  },
+  {
+    "prompt": "thanks a lot!",
+    "expected": "routine"
+  },
+  {
+    "prompt": "where can I find the invoice number?",
+    "expected": "routine"
+  },
+  {
+    "prompt": "hello there Jason",
+    "expected": "routine"
+  },
+  {
+    "prompt": "status of our worker cron",
+    "expected": "routine"
+  },
+  {
+    "prompt": "link to our internal figma board",
+    "expected": "routine"
+  },
+  {
+    "prompt": "looks good to me",
+    "expected": "routine"
+  },
+  {
+    "prompt": "can you check if the website returns 200 OK?",
+    "expected": "routine"
+  },
+  {
+    "prompt": "give me the support email address",
+    "expected": "routine"
+  },
+  {
+    "prompt": "is postgres service alive?",
+    "expected": "routine"
+  },
+  {
+    "prompt": "hi",
+    "expected": "routine"
+  },
+  {
+    "prompt": "[Replying to: \"Here is the staging preview link\"] [Azri] thanks received",
+    "expected": "routine"
+  },
+  {
+    "prompt": "draft a polite response informing the client about project delay",
+    "expected": "chat"
+  },
+  {
+    "prompt": "explain DNS propagation in simple terms for a non-tech founder",
+    "expected": "chat"
+  },
+  {
+    "prompt": "write a short announcement for our new clinic appointment feature",
+    "expected": "chat"
+  },
+  {
+    "prompt": "summarize this customer feedback meeting transcript",
+    "expected": "chat"
+  },
+  {
+    "prompt": "how should we structure our team wiki documentation?",
+    "expected": "chat"
+  },
+  {
+    "prompt": "give me 5 creative slogans for a modern aesthetic clinic",
+    "expected": "chat"
+  },
+  {
+    "prompt": "help me rephrase this email to sound more assertive but diplomatic",
+    "expected": "chat"
+  },
+  {
+    "prompt": "what are the standard working hours in Malaysia during Ramadan?",
+    "expected": "chat"
+  },
+  {
+    "prompt": "write an introduction paragraph for our company annual report",
+    "expected": "chat"
+  },
+  {
+    "prompt": "Find Dermalene contact in Bukku",
+    "expected": "chat"
+  },
+  {
+    "prompt": "can you review this email draft before I hit send?",
+    "expected": "chat"
+  },
+  {
+    "prompt": "write a brief LinkedIn post celebrating our agency milestone",
+    "expected": "chat"
+  },
+  {
+    "prompt": "what are the pros and cons of using Webflow vs WordPress?",
+    "expected": "chat"
+  },
+  {
+    "prompt": "create an outline for a 30-minute client discovery call",
+    "expected": "chat"
+  },
+  {
+    "prompt": "draft a WhatsApp follow-up for a lead who went silent after quote",
+    "expected": "chat"
+  },
+  {
+    "prompt": "the database server CPU spiked to 100% due to unindexed join queries on wp_postmeta",
+    "expected": "think"
+  },
+  {
+    "prompt": "audit our cloudflare traefik ingress setup and identify potential SSL renegotiation flaws",
+    "expected": "think"
+  },
+  {
+    "prompt": "debug this race condition where user sessions leak across browser tabs under high concurrency",
+    "expected": "think"
+  },
+  {
+    "prompt": "design a multi-tenant schema migration strategy with zero read downtime",
+    "expected": "think"
+  },
+  {
+    "prompt": "recursive parser throws stack overflow when evaluating nested AST nodes > 60 levels",
+    "expected": "think"
+  },
+  {
+    "prompt": "analyze the memory dump from our Coolify NodeJS container and locate the circular reference leak",
+    "expected": "think"
+  },
+  {
+    "prompt": "perform an end-to-end security penetration audit on our OAuth token exchange flow",
+    "expected": "think"
+  },
+  {
+    "prompt": "our Redis replica is desyncing every 2 hours under write pressure, diagnose replication buffer overrun",
+    "expected": "think"
+  },
+  {
+    "prompt": "architect a distributed task queue with idempotency guarantees using Kafka and Postgres",
+    "expected": "think"
+  },
+  {
+    "prompt": "find root cause of sporadic 502 Bad Gateway between Nginx and PHP-FPM upstream pool",
+    "expected": "think"
+  },
+  {
+    "prompt": "can you audit our wordpress database and create a full disaster recovery plan?",
+    "expected": "think"
+  },
+  {
+    "prompt": "optimize this complex PostgreSQL query taking 14 seconds on a 20M row table",
+    "expected": "think"
+  },
+  {
+    "prompt": "troubleshoot why Kubernetes pod restarts with OOMKilled despite cgroup limit set to 2GB",
+    "expected": "think"
+  },
+  {
+    "prompt": "refactor our monolith checkout state machine into an event-driven saga pattern",
+    "expected": "think"
+  },
+  {
+    "prompt": "[Replying to: \"Our WordPress staging site crashed with fatal error in WooCommerce class-wc-session-handler.php on line 64\"] [Azri] check this",
+    "expected": "think"
+  }
+]
