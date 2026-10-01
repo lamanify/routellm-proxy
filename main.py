@@ -1,21 +1,19 @@
-import os, re, httpx
+import os, re, json, httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 
-app = FastAPI(title="RouteLLM Proxy", version="1.0.0")
+app = FastAPI(title="RouteLLM Proxy", version="1.1.0")
 
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast")
 
-ROUTINE_KEYWORDS = [
-    r"\bping\b", r"\bstatus\b", r"\bhello\b", r"\bhi\b", r"\bthanks\b",
-    r"\bdate\b", r"\btime\b", r"\blist\b", r"\bcheck\b", r"\bheartbeat\b"
-]
-THINK_KEYWORDS = [
-    r"\baudit\b", r"\breason\b", r"\barchitecture\b", r"\bplan\b",
-    r"\bdeep research\b", r"\broot cause\b", r"\brefactor\b", r"\banalyze\b",
-    r"\bbenchmark\b", r"\bstrategy\b", r"\bsecurity\b"
-]
+CLASSIFIER_PROMPT = """Classify query into one of: routine, chat, think.
+routine: greetings, link queries, short status checks, pings
+chat: standard chat, explanations, copywriting, typical tasks
+think: audits, architecture, code debugging, disaster recovery plans
+
+Return JSON: {"route": "routine"|"chat"|"think"}"""
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -25,15 +23,45 @@ HOP_BY_HOP = {
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
-def classify_prompt(text: str) -> str:
-    text_lower = text.lower()
-    for kw in THINK_KEYWORDS:
-        if re.search(kw, text_lower):
-            return "think"
-    if len(text.split()) < 8:
-        for kw in ROUTINE_KEYWORDS:
-            if re.search(kw, text_lower):
-                return "routine"
+def clean_user_text(raw: str) -> str:
+    lines = raw.splitlines()
+    clean_lines = []
+    for l in lines:
+        cleaned = re.sub(r"^\[Replying to:.*?\]\s*", "", l)
+        cleaned = re.sub(r"^\[[A-Za-z0-9_ -]+\]\s*", "", cleaned)
+        if cleaned.strip():
+            clean_lines.append(cleaned.strip())
+    return " ".join(clean_lines).strip() or raw.strip()
+
+async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> str:
+    cleaned = clean_user_text(text)
+    if not cleaned:
+        return "chat"
+    try:
+        resp = await client.post(
+            f"{UPSTREAM}/chat/completions",
+            headers={"Authorization": f"Bearer {NEXUS_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": ROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": CLASSIFIER_PROMPT},
+                    {"role": "user", "content": f"Query: {cleaned}"}
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": 15,
+                "temperature": 0.0
+            },
+            timeout=3.0
+        )
+        if resp.status_code == 200:
+            raw = resp.text.replace("data: [DONE]", "").strip()
+            data = json.loads(raw)
+            msg = data["choices"][0]["message"]["content"]
+            route = json.loads(msg).get("route", "").lower().strip()
+            if route in ["routine", "chat", "think"]:
+                return route
+    except Exception as e:
+        print(f"[RouteLLM] Classifier fallback on error: {e}")
     return "chat"
 
 @app.get("/health")
@@ -74,9 +102,10 @@ async def chat_completions(request: Request):
                             user_text += item.get("text", "") + " "
                 break
         
-        chosen = classify_prompt(user_text) if user_text else "chat"
-        print(f"[RouteLLM] User prompt: {user_text[:50]!r} -> Routed to: {chosen}")
-        body["model"] = chosen
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            chosen = await classify_prompt_llm(client, user_text) if user_text else "chat"
+            print(f"[RouteLLM] User prompt: {user_text[:60]!r} -> Routed to: {chosen}")
+            body["model"] = chosen
 
     is_stream = bool(body.get("stream", False))
     headers = {
