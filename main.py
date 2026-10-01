@@ -52,7 +52,7 @@ async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, clien
             {"type": "text", "value": f"route:{route}"},
             {"type": "text", "value": "success"},
             {"type": "text", "value": json.dumps(payload)},
-            {"type": "integer", "value": int(datetime.now(timezone.utc).timestamp())}
+            {"type": "text", "value": str(int(datetime.now(timezone.utc).timestamp()))}
         ]
     }
     try:
