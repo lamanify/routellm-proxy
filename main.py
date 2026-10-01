@@ -29,6 +29,10 @@ def clean_headers(headers: httpx.Headers) -> dict:
 
 async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, client_ip: str = ""):
     if not TURSO_URL or not TURSO_TOKEN:
+        print(f"[RouteLLM] Turso telemetry skipped: TURSO_URL={bool(TURSO_URL)}, TURSO_TOKEN={bool(TURSO_TOKEN)}")
+        return
+
+    if not TURSO_URL or not TURSO_TOKEN:
         return
     payload = {
         "prompt": prompt_preview,
@@ -59,7 +63,7 @@ async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, clien
                 json={"requests": [{"type": "execute", "stmt": stmt}]}
             )
     except Exception as e:
-        print(f"[RouteLLM] Turso telemetry background error: {e}")
+        print(f"[RouteLLM] Turso telemetry background error: {type(e).__name__}: {e}")
 
 async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str, float]:
     cleaned = text.strip()
