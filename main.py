@@ -80,7 +80,7 @@ async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str
                 "max_tokens": 15,
                 "temperature": 0.0
             },
-            timeout=3.0
+            timeout=10.0
         )
         latency = round((time.time() - t0) * 1000, 1)
         if resp.status_code == 200:
@@ -91,7 +91,7 @@ async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str
             if route in ["routine", "chat", "think"]:
                 return route, latency
     except Exception as e:
-        print(f"[RouteLLM] Classifier fallback on error: {e}")
+        print(f"[RouteLLM] Classifier fallback on error: {type(e).__name__}: {e}")
     latency = round((time.time() - t0) * 1000, 1)
     return "chat", latency
 
