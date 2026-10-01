@@ -1,10 +1,11 @@
 import os, re, httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, Response
 
 app = FastAPI(title="RouteLLM Proxy", version="1.0.0")
 
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
-NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "sk-726c286c1beba453db47eb465f80b439")
+NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
 
 ROUTINE_KEYWORDS = [
     r"\bping\b", r"\bstatus\b", r"\bhello\b", r"\bhi\b", r"\bthanks\b",
@@ -33,7 +34,6 @@ def health():
 
 @app.get("/v1/models")
 async def list_models():
-    # Mirror models from upstream
     headers = {"Authorization": f"Bearer {NEXUS_KEY}"}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{UPSTREAM}/models", headers=headers)
@@ -44,7 +44,6 @@ async def chat_completions(request: Request):
     body = await request.json()
     model_req = body.get("model", "auto")
     
-    # Auto-classify if model is auto, default, chat, or routellm
     if model_req in ["auto", "default", "chat", "routellm"]:
         messages = body.get("messages", [])
         user_text = ""
@@ -68,14 +67,25 @@ async def chat_completions(request: Request):
         "Content-Type": "application/json"
     }
     
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        resp = await client.post(
-            f"{UPSTREAM}/chat/completions",
-            json=body,
-            headers=headers
-        )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers)
-        )
+    client = httpx.AsyncClient(timeout=180.0)
+    req = client.build_request("POST", f"{UPSTREAM}/chat/completions", json=body, headers=headers)
+    resp = await client.send(req, stream=True)
+    
+    async def stream_generator():
+        try:
+            async for chunk in resp.aiter_raw():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    res_headers = dict(resp.headers)
+    for h in ["content-encoding", "content-length", "transfer-encoding"]:
+        res_headers.pop(h, None)
+        
+    return StreamingResponse(
+        stream_generator(),
+        status_code=resp.status_code,
+        headers=res_headers,
+        media_type=resp.headers.get("content-type")
+    )
