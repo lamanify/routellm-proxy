@@ -1,17 +1,17 @@
-import os, re, json, httpx
+import os, json, httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 
-app = FastAPI(title="RouteLLM Proxy", version="1.1.0")
+app = FastAPI(title="RouteLLM Proxy", version="1.2.0")
 
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
 ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast")
 
 CLASSIFIER_PROMPT = """Classify query into one of: routine, chat, think.
-routine: greetings, link queries, short status checks, pings
+routine: greetings, link queries, short status checks, pings, simple acknowledgments
 chat: standard chat, explanations, copywriting, typical tasks
-think: audits, architecture, code debugging, disaster recovery plans
+think: audits, architecture, code debugging, disaster recovery plans, troubleshooting complex errors
 
 Return JSON: {"route": "routine"|"chat"|"think"}"""
 
@@ -23,18 +23,8 @@ HOP_BY_HOP = {
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
-def clean_user_text(raw: str) -> str:
-    lines = raw.splitlines()
-    clean_lines = []
-    for l in lines:
-        cleaned = re.sub(r"^\[Replying to:.*?\]\s*", "", l)
-        cleaned = re.sub(r"^\[[A-Za-z0-9_ -]+\]\s*", "", cleaned)
-        if cleaned.strip():
-            clean_lines.append(cleaned.strip())
-    return " ".join(clean_lines).strip() or raw.strip()
-
 async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> str:
-    cleaned = clean_user_text(text)
+    cleaned = text.strip()
     if not cleaned:
         return "chat"
     try:
