@@ -82,7 +82,8 @@ async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str
                 ],
                 "response_format": {"type": "json_object"},
                 "max_tokens": 15,
-                "temperature": 0.0
+                "temperature": 0.0,
+                "stream": False
             },
             timeout=10.0
         )
