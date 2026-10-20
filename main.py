@@ -1,13 +1,19 @@
 import os, json, time, asyncio, httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 
-app = FastAPI(title="RouteLLM Proxy", version="1.3.0")
+app = FastAPI(title="RouteLLM Proxy", version="1.4.0")
 
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
 ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast")
+
+# Upstream sometimes accepts a streaming request and then sends nothing for minutes.
+# Give each attempt FIRST_TOKEN_TIMEOUT seconds to produce its first chunk, then retry.
+FIRST_TOKEN_TIMEOUT = float(os.environ.get("FIRST_TOKEN_TIMEOUT", "60"))
+STALL_RETRIES = int(os.environ.get("STALL_RETRIES", "2"))
+STREAM_READ_TIMEOUT = float(os.environ.get("STREAM_READ_TIMEOUT", "180"))
 
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
@@ -100,6 +106,40 @@ async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str
     latency = round((time.time() - t0) * 1000, 1)
     return "chat", latency
 
+async def open_upstream_stream(body: dict, headers: dict):
+    """Send a streaming request, retrying attempts that produce no first chunk in time.
+
+    Returns (client, resp, chunks, first_chunk, attempt); the caller closes resp and client.
+    """
+    attempts = 1 + STALL_RETRIES
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT)
+        resp = None
+        t0 = time.time()
+
+        async def first_chunk():
+            nonlocal resp
+            req = client.build_request("POST", f"{UPSTREAM}/chat/completions", json=body, headers=headers)
+            resp = await client.send(req, stream=True)
+            chunks = resp.aiter_raw()
+            return chunks, await anext(chunks, b"")
+
+        try:
+            chunks, first = await asyncio.wait_for(first_chunk(), FIRST_TOKEN_TIMEOUT)
+            if attempt > 1:
+                print(f"[RouteLLM] First chunk after {time.time() - t0:.1f}s on attempt {attempt}/{attempts}")
+            return client, resp, chunks, first, attempt
+        except (asyncio.TimeoutError, httpx.TransportError) as e:
+            last_error = e
+            retrying = "; retrying" if attempt < attempts else ""
+            print(f"[RouteLLM] No first chunk after {time.time() - t0:.1f}s "
+                  f"(attempt {attempt}/{attempts}, {type(e).__name__}){retrying}")
+            if resp is not None:
+                await resp.aclose()
+            await client.aclose()
+    raise last_error
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "routellm-proxy"}
@@ -163,13 +203,25 @@ async def chat_completions(request: Request):
     }
     
     if is_stream:
-        client = httpx.AsyncClient(timeout=180.0)
-        req = client.build_request("POST", f"{UPSTREAM}/chat/completions", json=body, headers=headers)
-        resp = await client.send(req, stream=True)
-        
+        try:
+            client, resp, chunks, first, attempt = await open_upstream_stream(body, headers)
+        except (asyncio.TimeoutError, httpx.TransportError) as e:
+            timed_out = isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException))
+            return JSONResponse(
+                status_code=504 if timed_out else 502,
+                content={"error": {
+                    "message": f"Upstream gave no first chunk within {FIRST_TOKEN_TIMEOUT:.0f}s "
+                               f"on {1 + STALL_RETRIES} attempts ({type(e).__name__})",
+                    "type": "upstream_timeout" if timed_out else "upstream_error",
+                }},
+                headers={"X-RouteLLM-Choice": chosen},
+            )
+
         async def stream_generator():
             try:
-                async for chunk in resp.aiter_raw():
+                if first:
+                    yield first
+                async for chunk in chunks:
                     yield chunk
             finally:
                 await resp.aclose()
@@ -178,6 +230,7 @@ async def chat_completions(request: Request):
         resp_headers = clean_headers(resp.headers)
         resp_headers["X-RouteLLM-Choice"] = chosen
         resp_headers["X-RouteLLM-Latency"] = f"{latency_ms}ms"
+        resp_headers["X-RouteLLM-Attempts"] = str(attempt)
 
         return StreamingResponse(
             stream_generator(),
