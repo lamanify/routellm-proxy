@@ -14,11 +14,16 @@ ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-inst
 FIRST_TOKEN_TIMEOUT = float(os.environ.get("FIRST_TOKEN_TIMEOUT", "60"))
 STALL_RETRIES = int(os.environ.get("STALL_RETRIES", "2"))
 STREAM_READ_TIMEOUT = float(os.environ.get("STREAM_READ_TIMEOUT", "180"))
+# If an attempt has no first chunk after HEDGE_AFTER seconds, start the next one alongside it
+# and keep whichever answers first (0 disables hedging).
+HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "15"))
 
 # An agent turn makes many calls that all end with the same user message; classify it once.
 ROUTE_CACHE_TTL = float(os.environ.get("ROUTE_CACHE_TTL", "1800"))
 ROUTE_CACHE_MAX = 5000
 route_cache: dict[str, tuple[str, float]] = {}
+# Hermes background prompts (skill review, compression) go to "chat" without classifying.
+UNCLASSIFIED_CHAT_MARKERS = ("Review the conversation above", "summarization agent")
 
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
@@ -111,39 +116,71 @@ async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str
     latency = round((time.time() - t0) * 1000, 1)
     return "chat", latency
 
+def start_attempt(body: dict, headers: dict, attempt: int) -> dict:
+    """Start one upstream streaming attempt as a task that resolves to (chunks, first_chunk)."""
+    state = {"attempt": attempt, "client": httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT), "resp": None, "t0": time.time()}
+
+    async def first_chunk():
+        req = state["client"].build_request("POST", f"{UPSTREAM}/chat/completions", json=body, headers=headers)
+        state["resp"] = await state["client"].send(req, stream=True)
+        chunks = state["resp"].aiter_raw()
+        return chunks, await anext(chunks, b"")
+
+    state["task"] = asyncio.create_task(asyncio.wait_for(first_chunk(), FIRST_TOKEN_TIMEOUT))
+    return state
+
+async def close_attempt(state: dict):
+    state["task"].cancel()
+    try:
+        await state["task"]
+    except BaseException:
+        pass
+    if state["resp"] is not None:
+        await state["resp"].aclose()
+    await state["client"].aclose()
+
 async def open_upstream_stream(body: dict, headers: dict):
-    """Send a streaming request, retrying attempts that produce no first chunk in time.
+    """Send a streaming request, retrying and hedging attempts that produce no first chunk in time.
 
     Returns (client, resp, chunks, first_chunk, attempt); the caller closes resp and client.
     """
     attempts = 1 + STALL_RETRIES
+    hedge_after = HEDGE_AFTER if 0 < HEDGE_AFTER < FIRST_TOKEN_TIMEOUT else None
+    running = [start_attempt(body, headers, 1)]
+    started = 1
     last_error = None
-    for attempt in range(1, attempts + 1):
-        client = httpx.AsyncClient(timeout=STREAM_READ_TIMEOUT)
-        resp = None
-        t0 = time.time()
-
-        async def first_chunk():
-            nonlocal resp
-            req = client.build_request("POST", f"{UPSTREAM}/chat/completions", json=body, headers=headers)
-            resp = await client.send(req, stream=True)
-            chunks = resp.aiter_raw()
-            return chunks, await anext(chunks, b"")
-
-        try:
-            chunks, first = await asyncio.wait_for(first_chunk(), FIRST_TOKEN_TIMEOUT)
-            if attempt > 1:
-                print(f"[RouteLLM] First chunk after {time.time() - t0:.1f}s on attempt {attempt}/{attempts}")
-            return client, resp, chunks, first, attempt
-        except (asyncio.TimeoutError, httpx.TransportError) as e:
-            last_error = e
-            retrying = "; retrying" if attempt < attempts else ""
-            print(f"[RouteLLM] No first chunk after {time.time() - t0:.1f}s "
-                  f"(attempt {attempt}/{attempts}, {type(e).__name__}){retrying}")
-            if resp is not None:
-                await resp.aclose()
-            await client.aclose()
-    raise last_error
+    try:
+        while running:
+            done, _ = await asyncio.wait(
+                [s["task"] for s in running],
+                timeout=hedge_after if started < attempts else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                started += 1
+                print(f"[RouteLLM] No first chunk after {hedge_after:.0f}s; hedging with attempt {started}/{attempts}")
+                running.append(start_attempt(body, headers, started))
+                continue
+            for state in [s for s in running if s["task"] in done]:
+                running.remove(state)
+                try:
+                    chunks, first = state["task"].result()
+                except (asyncio.TimeoutError, httpx.TransportError) as e:
+                    last_error = e
+                    print(f"[RouteLLM] No first chunk after {time.time() - state['t0']:.1f}s "
+                          f"(attempt {state['attempt']}/{attempts}, {type(e).__name__})")
+                    await close_attempt(state)
+                    if started < attempts:
+                        started += 1
+                        running.append(start_attempt(body, headers, started))
+                    continue
+                if state["attempt"] > 1:
+                    print(f"[RouteLLM] First chunk after {time.time() - state['t0']:.1f}s on attempt {state['attempt']}/{attempts}")
+                return state["client"], state["resp"], chunks, first, state["attempt"]
+        raise last_error
+    finally:
+        for state in running:  # losers: free their upstream connections
+            await close_attempt(state)
 
 def stall_error(e: Exception, chosen: str) -> JSONResponse:
     timed_out = isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException))
@@ -250,7 +287,10 @@ async def chat_completions(request: Request):
         
         key = hashlib.sha256(user_text.encode()).hexdigest()
         cached = route_cache.get(key)
-        if cached and time.time() - cached[1] < ROUTE_CACHE_TTL:
+        if any(marker in user_text for marker in UNCLASSIFIED_CHAT_MARKERS):
+            chosen = "chat"
+            print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: chat (background prompt)")
+        elif cached and time.time() - cached[1] < ROUTE_CACHE_TTL:
             chosen = cached[0]
             print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: {chosen} (cached)")
         else:
