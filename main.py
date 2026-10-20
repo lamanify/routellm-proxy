@@ -140,6 +140,69 @@ async def open_upstream_stream(body: dict, headers: dict):
             await client.aclose()
     raise last_error
 
+def stall_error(e: Exception, chosen: str) -> JSONResponse:
+    timed_out = isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException))
+    return JSONResponse(
+        status_code=504 if timed_out else 502,
+        content={"error": {
+            "message": f"Upstream gave no first chunk within {FIRST_TOKEN_TIMEOUT:.0f}s "
+                       f"on {1 + STALL_RETRIES} attempts ({type(e).__name__})",
+            "type": "upstream_timeout" if timed_out else "upstream_error",
+        }},
+        headers={"X-RouteLLM-Choice": chosen},
+    )
+
+def sse_to_completion(raw: bytes) -> dict | None:
+    """Merge a stream of chat.completion.chunk events into one chat.completion (None if none parsed)."""
+    completion = {"object": "chat.completion"}
+    choices = {}
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:") or line[5:].strip() in ("", "[DONE]"):
+            continue
+        try:
+            chunk = json.loads(line[5:])
+        except ValueError:
+            continue
+        for key in ("id", "created", "model", "system_fingerprint"):
+            if chunk.get(key) is not None:
+                completion.setdefault(key, chunk[key])
+        if chunk.get("usage"):
+            completion["usage"] = chunk["usage"]
+        for c in chunk.get("choices") or []:
+            choice = choices.setdefault(c.get("index", 0), {"message": {"role": "assistant"}, "calls": {}, "finish_reason": None})
+            for key, value in (c.get("delta") or {}).items():
+                if key == "tool_calls":
+                    calls = choice["calls"]
+                    for tc in value or []:
+                        idx = tc.get("index")
+                        if idx is None:  # no index: a new id starts a new call, otherwise continue the last one
+                            idx = len(calls) if tc.get("id") or not calls else max(calls)
+                        call = calls.setdefault(idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                        call["id"] = tc.get("id") or call["id"]
+                        call["type"] = tc.get("type") or call["type"]
+                        fn = tc.get("function") or {}
+                        call["function"]["name"] = call["function"]["name"] or fn.get("name") or ""
+                        call["function"]["arguments"] += fn.get("arguments") or ""
+                elif key == "role":
+                    choice["message"]["role"] = value or "assistant"
+                elif isinstance(value, str):
+                    choice["message"][key] = choice["message"].get(key, "") + value
+            if c.get("finish_reason"):
+                choice["finish_reason"] = c["finish_reason"]
+    if not choices:
+        return None
+    completion["choices"] = []
+    for idx, choice in sorted(choices.items()):
+        message = choice["message"]
+        if choice["calls"]:
+            message["tool_calls"] = [call for _, call in sorted(choice["calls"].items())]
+            message["content"] = message.get("content") or None
+        else:
+            message.setdefault("content", "")
+        completion["choices"].append({"index": idx, "message": message, "finish_reason": choice["finish_reason"] or "stop"})
+    return completion
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "routellm-proxy"}
@@ -206,16 +269,7 @@ async def chat_completions(request: Request):
         try:
             client, resp, chunks, first, attempt = await open_upstream_stream(body, headers)
         except (asyncio.TimeoutError, httpx.TransportError) as e:
-            timed_out = isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException))
-            return JSONResponse(
-                status_code=504 if timed_out else 502,
-                content={"error": {
-                    "message": f"Upstream gave no first chunk within {FIRST_TOKEN_TIMEOUT:.0f}s "
-                               f"on {1 + STALL_RETRIES} attempts ({type(e).__name__})",
-                    "type": "upstream_timeout" if timed_out else "upstream_error",
-                }},
-                headers={"X-RouteLLM-Choice": chosen},
-            )
+            return stall_error(e, chosen)
 
         async def stream_generator():
             try:
@@ -239,14 +293,39 @@ async def chat_completions(request: Request):
             media_type=resp.headers.get("content-type", "text/event-stream")
         )
     else:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(f"{UPSTREAM}/chat/completions", json=body, headers=headers)
-            resp_headers = clean_headers(resp.headers)
-            resp_headers["X-RouteLLM-Choice"] = chosen
-            resp_headers["X-RouteLLM-Latency"] = f"{latency_ms}ms"
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=resp_headers,
-                media_type=resp.headers.get("content-type", "application/json")
+        # Upstream answers a request without "stream" as SSE, and its non-streaming mode is
+        # far slower than streaming. Always stream upstream and merge it into one completion.
+        body["stream"] = True
+        body.setdefault("stream_options", {"include_usage": True})
+        try:
+            client, resp, chunks, first, attempt = await open_upstream_stream(body, headers)
+        except (asyncio.TimeoutError, httpx.TransportError) as e:
+            return stall_error(e, chosen)
+        try:
+            raw = first + b"".join([chunk async for chunk in chunks])
+        except httpx.TransportError as e:
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": f"Upstream stream broke mid-response ({type(e).__name__})",
+                                   "type": "upstream_error"}},
+                headers={"X-RouteLLM-Choice": chosen},
             )
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+        resp_headers = {
+            "X-RouteLLM-Choice": chosen,
+            "X-RouteLLM-Latency": f"{latency_ms}ms",
+            "X-RouteLLM-Attempts": str(attempt),
+        }
+        is_sse = "text/event-stream" in resp.headers.get("content-type", "")
+        completion = sse_to_completion(raw) if resp.status_code == 200 and is_sse else None
+        if completion is not None:
+            return JSONResponse(completion, headers=resp_headers)
+        return Response(
+            content=raw,
+            status_code=resp.status_code,
+            headers={**clean_headers(resp.headers), **resp_headers},
+            media_type=resp.headers.get("content-type", "application/json")
+        )
