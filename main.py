@@ -1,9 +1,9 @@
-import os, json, time, asyncio, hashlib, httpx
+import os, re, json, time, asyncio, hashlib, httpx
+from collections import Counter, OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response, JSONResponse
-
-app = FastAPI(title="RouteLLM Proxy", version="1.4.0")
 
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
@@ -18,20 +18,48 @@ STREAM_READ_TIMEOUT = float(os.environ.get("STREAM_READ_TIMEOUT", "180"))
 # and keep whichever answers first (0 disables hedging).
 HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "15"))
 
+# Classifier: a request waits at most CLASSIFIER_BUDGET seconds for the route, then uses the
+# conversation's last tier (DEFAULT_TIER if none) while the classification finishes in the
+# background. One classification gets CLASSIFIER_TIMEOUT seconds in total, with a second
+# attempt started alongside the first after CLASSIFIER_HEDGE seconds (0 disables the hedge).
+CLASSIFIER_BUDGET = float(os.environ.get("CLASSIFIER_BUDGET", "1.5"))
+CLASSIFIER_TIMEOUT = float(os.environ.get("CLASSIFIER_TIMEOUT", "2.5"))
+CLASSIFIER_HEDGE = float(os.environ.get("CLASSIFIER_HEDGE", "1.0"))
+DEFAULT_TIER = os.environ.get("DEFAULT_TIER", "chat")
+# Rule-based shortcuts (greetings, continuations, stack traces) that skip the LLM classifier.
+PREFILTER = os.environ.get("PREFILTER", "1") != "0"
+# Classify the Slack instruction instead of the whole wrapped message, and inherit the
+# conversation's last tier for continuations and system notices.
+CONTEXT_ROUTING = os.environ.get("CONTEXT_ROUTING", "1") != "0"
+# Warn when the model that actually answered does not contain this text ("" disables).
+EXPECTED_MODEL = os.environ.get("EXPECTED_MODEL_SUBSTR", "gemini").lower()
+MODELS_CACHE_TTL = float(os.environ.get("MODELS_CACHE_TTL", "60"))
+
+TIERS = ("routine", "chat", "think")
+if DEFAULT_TIER not in TIERS:
+    DEFAULT_TIER = "chat"
+
 # An agent turn makes many calls that all end with the same user message; classify it once.
 ROUTE_CACHE_TTL = float(os.environ.get("ROUTE_CACHE_TTL", "1800"))
 ROUTE_CACHE_MAX = 5000
 route_cache: dict[str, tuple[str, float]] = {}
+CONV_TTL = float(os.environ.get("CONV_TTL", "21600"))
+CONV_MAX = 5000
+conv_state: "OrderedDict[str, tuple[str, float]]" = OrderedDict()  # conversation key -> (last tier, time)
+inflight: dict[str, asyncio.Task] = {}
+background: set[asyncio.Task] = set()
+stats: Counter = Counter()
 # Hermes background prompts (skill review, compression) go to "chat" without classifying.
 UNCLASSIFIED_CHAT_MARKERS = ("Review the conversation above", "summarization agent")
 
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 
-CLASSIFIER_PROMPT = """Classify query into one of: routine, chat, think.
-routine: greetings, link queries, short status checks, pings, simple acknowledgments
+CLASSIFIER_PROMPT = """Classify the user's request into one of: routine, chat, think.
+routine: greetings, thanks, simple acknowledgments, pings, simple lookups of a link, status or fact
 chat: standard chat, explanations, copywriting, typical tasks
-think: audits, architecture, code debugging, disaster recovery plans, troubleshooting complex errors
+think: audits, architecture, code debugging, disaster recovery plans, troubleshooting complex errors, and requests to check, crawl, test or review many pages or systems or to carry out multi-step work
+Judge by how much work the request implies, not by how short it is. A context line, if present, is only the message being replied to: use it to understand what the request refers to.
 
 Return JSON: {"route": "routine"|"chat"|"think"}"""
 
@@ -40,14 +68,44 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-encoding", "content-length"
 }
 
+http: httpx.AsyncClient  # shared pool (set in lifespan) so Nexus connections stay warm
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global http
+    http = httpx.AsyncClient(
+        timeout=30.0,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        transport=httpx.AsyncHTTPTransport(retries=1),  # retries connect errors only
+    )
+    try:
+        yield
+    finally:
+        for task in list(background):
+            task.cancel()
+        await http.aclose()
+
+app = FastAPI(title="RouteLLM Proxy", version="1.5.0", lifespan=lifespan)
+
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
-async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, client_ip: str = ""):
-    if not TURSO_URL or not TURSO_TOKEN:
-        print(f"[RouteLLM] Turso telemetry skipped: TURSO_URL={bool(TURSO_URL)}, TURSO_TOKEN={bool(TURSO_TOKEN)}")
-        return
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    background.add(task)
+    task.add_done_callback(background.discard)
+    return task
 
+def log_event(**fields):
+    """One JSON line per request: route, fallback reason, timings, answering model."""
+    print(json.dumps({"evt": "req", "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", **fields},
+                     separators=(",", ":"), default=str), flush=True)
+
+def ms_since(t0: float) -> float:
+    return round((time.time() - t0) * 1000, 1)
+
+async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, client_ip: str = "",
+                       status: str = "success", extra: dict | None = None):
     if not TURSO_URL or not TURSO_TOKEN:
         return
     payload = {
@@ -55,7 +113,8 @@ async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, clien
         "route": route,
         "latency_ms": latency_ms,
         "client_ip": client_ip,
-        "model": ROUTER_MODEL
+        "model": ROUTER_MODEL,
+        **(extra or {}),
     }
     stmt = {
         "sql": """
@@ -66,55 +125,270 @@ async def log_to_turso(prompt_preview: str, route: str, latency_ms: float, clien
         "args": [
             {"type": "text", "value": "routellm-proxy"},
             {"type": "text", "value": f"route:{route}"},
-            {"type": "text", "value": "success"},
+            {"type": "text", "value": status},
             {"type": "text", "value": json.dumps(payload)},
             {"type": "text", "value": str(int(datetime.now(timezone.utc).timestamp()))}
         ]
     }
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            await client.post(
-                TURSO_URL,
-                headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"},
-                json={"requests": [{"type": "execute", "stmt": stmt}]}
-            )
+        await http.post(
+            TURSO_URL,
+            headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"},
+            json={"requests": [{"type": "execute", "stmt": stmt}]},
+            timeout=3.0,
+        )
     except Exception as e:
         print(f"[RouteLLM] Turso telemetry background error: {type(e).__name__}: {e}")
 
-async def classify_prompt_llm(client: httpx.AsyncClient, text: str) -> tuple[str, float]:
-    cleaned = text.strip()
-    if not cleaned:
-        return "chat", 0.0
-    t0 = time.time()
+# ---------------------------------------------------------------------------
+# Reading the conversation: what is the user actually asking?
+# ---------------------------------------------------------------------------
+
+def message_text(m: dict) -> str:
+    content = m.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text").strip()
+    return ""
+
+# Hermes-injected blocks that are not the user's words.
+MEMORY_RE = re.compile(r"<memory-context>.*?(?:</memory-context>|\Z)", re.S)
+SYSTEM_NOTE_RE = re.compile(r"\[System note.*?(?:\n\s*\n|\Z)", re.S | re.I)
+# Messages that carry no new request: system notes, delegation/iteration notices, compaction handoffs.
+NOTICE_RE = re.compile(
+    r"^\s*\[(?:System\b|ASYNC DELEGATION|CONTEXT COMPACTION|STILL IN PROGRESS|Context from the interrupted"
+    r"|[^\]\n]{0,60}\b(?:tool[- ]iteration|iteration (?:limit|budget)|max(?:imum)? iterations))", re.I)
+REPLY_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>.*)$', re.S)
+REPLY_WITH_SENDER_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>\[[^\]\n]{1,80}\].*)$', re.S)
+SENDER_RE = re.compile(r"^\s*\[[^\]\n|]{1,60}(?:\s*\|\s*Slack user\s*<@\w+>)?\]\s*")
+OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE")
+THREAD_RE = re.compile(r"^\s*\[Thread context\b[^\]\n]*\]\s*", re.I)
+
+def split_message(text: str) -> tuple[str, str]:
+    """Return (instruction, context). instruction == "" means the message carries no new request."""
+    text = MEMORY_RE.sub("", text)
+    if NOTICE_RE.match(text):
+        return "", ""
+    text = SYSTEM_NOTE_RE.sub("", text).strip()
+    context = ""
+    if OOB_RE.match(text):
+        lines = text.split("\n")[1:]
+        while lines and (not lines[0].strip() or lines[0].lstrip().startswith(("Gateway message origin", "{", "["))):
+            lines.pop(0)
+        text = "\n".join(lines).strip()
+    elif THREAD_RE.match(text):
+        parts = THREAD_RE.sub("", text, count=1).split("\n\n")
+        text, context = (parts[-1], "\n\n".join(parts[:-1])) if len(parts) > 1 else ("", "")
+    m = REPLY_WITH_SENDER_RE.match(text) or REPLY_RE.match(text)
+    if m:
+        context, text = m.group("ctx"), m.group("rest")
+    return SENDER_RE.sub("", text, count=1).strip(), context.strip()
+
+# --- rule-based prefilter (obvious cases, no LLM call) ---
+SOCIAL_RE = re.compile(
+    r"^(?:hi+|hello|hey+|yo|hiya|good (?:morning|afternoon|evening)|ping|pong|test|testing"
+    r"|thanks?(?: you)?(?: (?:a lot|so much|very much|again|received|noted|man|mate|bro))?|thank you(?: so much| very much)?|thx|ty|cheers|many thanks"
+    r"|got it|noted|received|understood|cool|nice|great|awesome|perfect|will do|(?:ok|okay),? thanks?)"
+    r"(?:\s+(?:there|all|team|everyone|guys))?(?:\s+[a-z]{2,12})?$")
+CONTINUE_WORDS = frozenset("""continue go on ahead proceed carry keep going yes yep yeah yup ok okay sure approved approve confirmed confirm
+    do it that this ship deploy retry try again fix apply run please pls now then and the plan lgtm looks good sounds to me""".split())
+CONTINUE_SIGNALS = frozenset("""continue go proceed carry keep yes yep yeah yup ok okay sure approved approve confirmed confirm
+    do ship deploy retry try fix apply run lgtm looks sounds""".split())
+STACK_RE = re.compile(
+    r"Traceback \(most recent call last\)|\bStack trace:|PHP (?:Fatal|Parse) error|Fatal error: Uncaught|Exception in thread"
+    r"|\bpanic: |Segmentation fault|OOMKilled|File \"[^\"\n]+\", line \d+|(?:^|\n)\s*at [\w.$<>]+ \([^)\n]+:\d+:\d+\)"
+    r"|(?:^|\n)#\d+ [^\n]*\.php")
+
+def prefilter(instruction: str, context: str) -> tuple[str, str] | None:
+    """Cheap rules for obvious cases. Returns ("tier", <tier>) or ("inherit", <tier if no history>)."""
+    flat = re.sub(r"[^\w\s]|_", " ", instruction.lower())
+    flat = re.sub(r"\s+", " ", flat).strip()
+    words = flat.split()
+    if not words:
+        return None
+    if len(words) <= 6 and STACK_RE.search(context) and len(instruction) <= 60 and not SOCIAL_RE.match(flat):
+        return "tier", "think"
+    if STACK_RE.search(instruction):
+        return "tier", "think"
+    if len(words) <= 5 and SOCIAL_RE.match(flat):
+        return "tier", "routine"
+    if len(words) <= 6 and all(w in CONTINUE_WORDS for w in words) and any(w in CONTINUE_SIGNALS for w in words):
+        return "inherit", "routine" if words[0] in ("lgtm", "looks", "sounds") else DEFAULT_TIER
+    return None
+
+# ---------------------------------------------------------------------------
+# Route state: per-conversation last tier, per-conversation-and-message cache
+# ---------------------------------------------------------------------------
+
+def conversation_key(messages: list) -> str:
+    """All requests arrive from one proxy IP, so identify a conversation from its body."""
+    system = next((message_text(m) for m in messages if m.get("role") in ("system", "developer")), "")
+    first_user = next((message_text(m) for m in messages if m.get("role") == "user"), "")
+    return hashlib.sha1(f"{system}\x00{first_user}".encode()).hexdigest()[:12]
+
+def conv_last_tier(conv: str) -> str | None:
+    entry = conv_state.get(conv)
+    if entry and time.time() - entry[1] < CONV_TTL:
+        return entry[0]
+    return None
+
+def conv_set(conv: str, tier: str):
+    conv_state[conv] = (tier, time.time())
+    conv_state.move_to_end(conv)
+    while len(conv_state) > CONV_MAX:
+        conv_state.popitem(last=False)
+
+def cache_put(key: str, tier: str):
+    if len(route_cache) >= ROUTE_CACHE_MAX:
+        cutoff = time.time() - ROUTE_CACHE_TTL
+        for k in [k for k, (_, t) in route_cache.items() if t < cutoff] or list(route_cache)[:ROUTE_CACHE_MAX // 2]:
+            del route_cache[k]
+    route_cache[key] = (tier, time.time())
+
+# ---------------------------------------------------------------------------
+# LLM classifier
+# ---------------------------------------------------------------------------
+
+def classifier_input(instruction: str, context: str) -> str:
+    if len(instruction) > 1500:
+        instruction = instruction[:1000] + " ... " + instruction[-400:]
+    text = f"Query: {instruction}"
+    if context:
+        text += f"\nContext (the message being replied to): {context[:500]}"
+    return text
+
+async def classifier_call(instruction: str, context: str) -> tuple[str | None, str]:
+    """One classifier request. Returns (route, "ok") or (None, reason)."""
     try:
-        resp = await client.post(
+        resp = await http.post(
             f"{UPSTREAM}/chat/completions",
             headers={"Authorization": f"Bearer {NEXUS_KEY}", "Content-Type": "application/json"},
             json={
                 "model": ROUTER_MODEL,
                 "messages": [
                     {"role": "system", "content": CLASSIFIER_PROMPT},
-                    {"role": "user", "content": f"Query: {cleaned}"}
+                    {"role": "user", "content": classifier_input(instruction, context)}
                 ],
                 "response_format": {"type": "json_object"},
                 "max_tokens": 15,
                 "temperature": 0.0,
                 "stream": False
             },
-            timeout=10.0
+            timeout=CLASSIFIER_TIMEOUT,
         )
-        latency = round((time.time() - t0) * 1000, 1)
-        if resp.status_code == 200:
-            raw = resp.text.replace("data: [DONE]", "").strip()
-            data = json.loads(raw)
-            msg = data["choices"][0]["message"]["content"]
-            route = json.loads(msg).get("route", "").lower().strip()
-            if route in ["routine", "chat", "think"]:
-                return route, latency
-    except Exception as e:
-        print(f"[RouteLLM] Classifier fallback on error: {type(e).__name__}: {e}")
-    latency = round((time.time() - t0) * 1000, 1)
-    return "chat", latency
+    except httpx.TimeoutException:
+        return None, "timeout"
+    except httpx.HTTPError as e:
+        return None, f"transport_{type(e).__name__}"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+    try:
+        raw = resp.text.replace("data: [DONE]", "").strip()
+        route = json.loads(json.loads(raw)["choices"][0]["message"]["content"]).get("route", "")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None, "invalid_json"
+    route = str(route).lower().strip()
+    return (route, "ok") if route in TIERS else (None, "invalid_route")
+
+async def classify_hedged(instruction: str, context: str) -> tuple[str | None, str, float, int]:
+    """Classify within CLASSIFIER_TIMEOUT, hedging after CLASSIFIER_HEDGE. Returns (route, reason, ms, attempts)."""
+    t0 = time.time()
+    deadline = t0 + CLASSIFIER_TIMEOUT
+    tasks = {asyncio.create_task(classifier_call(instruction, context))}
+    attempts, last_reason = 1, "timeout"
+    can_hedge = CLASSIFIER_HEDGE > 0
+    try:
+        while tasks:
+            now = time.time()
+            if now >= deadline:
+                break
+            wait = deadline - now
+            if can_hedge:
+                wait = min(wait, max(0.0, t0 + CLASSIFIER_HEDGE - now))
+            done, _ = await asyncio.wait(tasks, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                tasks.discard(task)
+                route, reason = task.result()
+                if route:
+                    return route, "ok", ms_since(t0), attempts
+                last_reason = reason
+            if can_hedge and (not done and time.time() >= t0 + CLASSIFIER_HEDGE - 0.01 or not tasks):
+                can_hedge = False  # one extra attempt: on the hedge timer, or at once if the first one failed
+                attempts += 1
+                tasks.add(asyncio.create_task(classifier_call(instruction, context)))
+    finally:
+        for task in tasks:
+            task.cancel()
+    return None, last_reason, ms_since(t0), attempts
+
+async def run_classification(key: str, conv: str, instruction: str, context: str, preview: str, client_ip: str):
+    """Classify and record the outcome. Runs as a task so it finishes even if the request stopped waiting."""
+    try:
+        route, reason, ms, attempts = await classify_hedged(instruction, context)
+        if route:
+            stats["classifier_ok"] += 1
+            cache_put(key, route)  # only real answers are cached, never fallbacks
+            conv_set(conv, route)
+        else:
+            stats[f"classifier_fail_{reason}"] += 1
+            print(f"[RouteLLM] Classifier failed ({reason}) after {ms}ms, {attempts} attempt(s)")
+        spawn(log_to_turso(preview, route or conv_last_tier(conv) or DEFAULT_TIER, ms, client_ip,
+                           status="success" if route else "fallback",
+                           extra={"src": "llm" if route else "fallback", "reason": reason, "attempts": attempts}))
+        return route, reason, ms, attempts
+    finally:
+        inflight.pop(key, None)
+
+async def route_request(messages: list, client_ip: str = "") -> dict:
+    """Pick a tier for a chat request. Never waits more than CLASSIFIER_BUDGET for the LLM."""
+    conv = conversation_key(messages)
+    last_user = next((message_text(m) for m in reversed(messages) if m.get("role") == "user"), "")
+    d = {"tier": DEFAULT_TIER, "src": "default", "reason": None, "classify_ms": 0.0, "conv": conv, "prompt": last_user[:60]}
+    if not last_user.strip():
+        return d
+    if any(marker in last_user for marker in UNCLASSIFIED_CHAT_MARKERS):
+        return {**d, "tier": "chat", "src": "background"}
+
+    previous = conv_last_tier(conv)
+    if CONTEXT_ROUTING:
+        instruction, context = split_message(last_user)
+        d["prompt"] = (instruction or last_user)[:60]
+        if not instruction:
+            return {**d, "tier": previous or DEFAULT_TIER, "src": "inherit", "reason": "notice"}
+    else:
+        instruction, context = last_user.strip(), ""
+    if PREFILTER:
+        hit = prefilter(instruction, context)
+        if hit and hit[0] == "tier":
+            if hit[1] != "routine":
+                conv_set(conv, hit[1])
+            return {**d, "tier": hit[1], "src": "rule"}
+        if hit and hit[0] == "inherit" and (previous or not context):
+            return {**d, "tier": previous or hit[1], "src": "inherit", "reason": "continuation"}
+
+    key = hashlib.sha256(f"{conv}\x00{instruction}\x00{context[:300]}".encode()).hexdigest()
+    cached = route_cache.get(key)
+    if cached and time.time() - cached[1] < ROUTE_CACHE_TTL:
+        conv_set(conv, cached[0])
+        return {**d, "tier": cached[0], "src": "cache"}
+
+    task = inflight.get(key)
+    if task is None:
+        task = inflight[key] = spawn(run_classification(key, conv, instruction, context, instruction[:200], client_ip))
+    done, _ = await asyncio.wait({task}, timeout=CLASSIFIER_BUDGET)
+    fallback = previous or DEFAULT_TIER
+    if not done:
+        stats["fallback_budget"] += 1
+        return {**d, "tier": fallback, "src": "fallback", "reason": "budget", "classify_ms": round(CLASSIFIER_BUDGET * 1000, 1)}
+    try:
+        route, reason, ms, _ = task.result()
+    except Exception as e:  # classification task crashed: treat as a failed classification
+        route, reason, ms = None, f"error_{type(e).__name__}", 0.0
+    if route:
+        return {**d, "tier": route, "src": "llm", "classify_ms": ms}
+    stats[f"fallback_{reason}"] += 1
+    return {**d, "tier": fallback, "src": "fallback", "reason": reason, "classify_ms": ms}
 
 def start_attempt(body: dict, headers: dict, attempt: int) -> dict:
     """Start one upstream streaming attempt as a task that resolves to (chunks, first_chunk)."""
@@ -245,102 +519,119 @@ def sse_to_completion(raw: bytes) -> dict | None:
         completion["choices"].append({"index": idx, "message": message, "finish_reason": choice["finish_reason"] or "stop"})
     return completion
 
+
+MODEL_FIELD_RE = re.compile(rb'"model"\s*:\s*"([^"]+)"')
+
+def model_from_bytes(raw: bytes) -> str | None:
+    m = MODEL_FIELD_RE.search(raw)
+    return m.group(1).decode("utf-8", "replace") if m else None
+
+def check_model(rec: dict, model: str | None):
+    """Record which model answered and flag answers from outside the expected family (e.g. fallbacks)."""
+    rec["resp_model"] = model
+    if EXPECTED_MODEL and model and EXPECTED_MODEL not in model.lower():
+        rec["model_warn"] = True
+        stats["unexpected_model"] += 1
+        print(f"[RouteLLM] WARN answered by {model!r}, not a {EXPECTED_MODEL} model (tier {rec.get('tier')}): likely an upstream fallback")
+
+models_cache: dict = {"entry": None, "at": 0.0}
+models_lock = asyncio.Lock()
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "routellm-proxy"}
 
+@app.get("/stats")
+def get_stats():
+    return {"counters": dict(stats), "route_cache": len(route_cache), "conversations": len(conv_state), "inflight": len(inflight)}
+
 @app.get("/v1/models")
 async def list_models():
-    headers = {
-        "Authorization": f"Bearer {NEXUS_KEY}",
-        "Accept-Encoding": "identity"
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{UPSTREAM}/models", headers=headers)
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=clean_headers(resp.headers),
-            media_type=resp.headers.get("content-type", "application/json")
-        )
+    async with models_lock:  # one upstream fetch at a time; the rest read the cache
+        entry = models_cache["entry"]
+        if entry is None or time.time() - models_cache["at"] >= MODELS_CACHE_TTL:
+            try:
+                resp = await http.get(f"{UPSTREAM}/models", headers={"Authorization": f"Bearer {NEXUS_KEY}", "Accept-Encoding": "identity"})
+            except httpx.HTTPError:
+                if entry is None:
+                    raise
+                stats["models_stale"] += 1  # upstream down: serve the last good list
+            else:
+                entry = (resp.content, resp.status_code, clean_headers(resp.headers), resp.headers.get("content-type", "application/json"))
+                if resp.status_code == 200:
+                    models_cache["entry"], models_cache["at"] = entry, time.time()
+    content, status, headers, media_type = entry
+    return Response(content=content, status_code=status, headers=headers, media_type=media_type)
+
+@app.post("/v1/route")
+async def route_only(request: Request):
+    """Routing decision for a chat request body, without calling the model (used by run_evals.py)."""
+    body = await request.json()
+    d = await route_request(body.get("messages") or [], request.client.host if request.client else "")
+    return {"route": d["tier"], "src": d["src"], "reason": d["reason"], "classify_ms": d["classify_ms"], "conversation": d["conv"]}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    t_start = time.time()
     body = await request.json()
     model_req = body.get("model", "auto")
     chosen = "chat"
-    latency_ms = 0.0
-    
+    rec = {"stream": bool(body.get("stream", False)), "model_req": model_req}
+
     if model_req in ["auto", "default", "chat", "routellm"]:
-        messages = body.get("messages", [])
-        user_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                content = m.get("content", "")
-                if isinstance(content, str):
-                    user_text = content
-                elif isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            user_text += item.get("text", "") + " "
-                break
-        
-        key = hashlib.sha256(user_text.encode()).hexdigest()
-        cached = route_cache.get(key)
-        if any(marker in user_text for marker in UNCLASSIFIED_CHAT_MARKERS):
-            chosen = "chat"
-            print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: chat (background prompt)")
-        elif cached and time.time() - cached[1] < ROUTE_CACHE_TTL:
-            chosen = cached[0]
-            print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: {chosen} (cached)")
-        else:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                chosen, latency_ms = await classify_prompt_llm(client, user_text) if user_text else ("chat", 0.0)
-            print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: {chosen} ({latency_ms}ms)")
-            if len(route_cache) >= ROUTE_CACHE_MAX:
-                cutoff = time.time() - ROUTE_CACHE_TTL
-                for k in [k for k, (_, t) in route_cache.items() if t < cutoff] or list(route_cache)[:ROUTE_CACHE_MAX // 2]:
-                    del route_cache[k]
-            route_cache[key] = (chosen, time.time())
-
-            # Non-blocking background log to Turso
-            asyncio.create_task(
-                log_to_turso(
-                    prompt_preview=user_text[:200],
-                    route=chosen,
-                    latency_ms=latency_ms,
-                    client_ip=request.client.host if request.client else ""
-                )
-            )
+        d = await route_request(body.get("messages") or [], request.client.host if request.client else "")
+        chosen = d["tier"]
+        rec.update(conv=d["conv"], tier=chosen, route_src=d["src"], fallback_reason=d["reason"] if d["src"] == "fallback" else None,
+                   classify_ms=d["classify_ms"], prompt=d["prompt"])
         body["model"] = chosen
+    else:
+        rec.update(tier=model_req, route_src="explicit")
+    latency_ms = rec.get("classify_ms", 0.0)
 
-    is_stream = bool(body.get("stream", False))
+    is_stream = rec["stream"]
     headers = {
         "Authorization": f"Bearer {NEXUS_KEY}",
         "Content-Type": "application/json",
         "Accept-Encoding": "identity"
     }
-    
+
+    def finish(status: int, **extra):
+        log_event(**rec, status=status, total_ms=ms_since(t_start), **extra)
+
+    t_upstream = time.time()
     if is_stream:
         try:
             client, resp, chunks, first, attempt = await open_upstream_stream(body, headers)
         except (asyncio.TimeoutError, httpx.TransportError) as e:
+            finish(504 if isinstance(e, asyncio.TimeoutError) else 502, upstream_error=type(e).__name__)
             return stall_error(e, chosen)
+        rec.update(attempts=attempt, ttft_ms=ms_since(t_start), upstream_ttft_ms=ms_since(t_upstream))
+        check_model(rec, model_from_bytes(first))
 
         async def stream_generator():
+            seen = first
+            completed = False
             try:
                 if first:
                     yield first
                 async for chunk in chunks:
+                    if rec["resp_model"] is None and len(seen) < 8192:
+                        seen += chunk
+                        check_model(rec, model_from_bytes(seen))
                     yield chunk
+                completed = True
             finally:
                 await resp.aclose()
                 await client.aclose()
+                finish(resp.status_code, completed=completed)
 
         resp_headers = clean_headers(resp.headers)
         resp_headers["X-RouteLLM-Choice"] = chosen
         resp_headers["X-RouteLLM-Latency"] = f"{latency_ms}ms"
         resp_headers["X-RouteLLM-Attempts"] = str(attempt)
+        resp_headers["X-RouteLLM-Source"] = rec.get("route_src", "")
+        if rec.get("resp_model"):
+            resp_headers["X-RouteLLM-Model"] = rec["resp_model"]
 
         return StreamingResponse(
             stream_generator(),
@@ -356,10 +647,13 @@ async def chat_completions(request: Request):
         try:
             client, resp, chunks, first, attempt = await open_upstream_stream(body, headers)
         except (asyncio.TimeoutError, httpx.TransportError) as e:
+            finish(504 if isinstance(e, asyncio.TimeoutError) else 502, upstream_error=type(e).__name__)
             return stall_error(e, chosen)
+        rec.update(attempts=attempt, ttft_ms=ms_since(t_start), upstream_ttft_ms=ms_since(t_upstream))
         try:
             raw = first + b"".join([chunk async for chunk in chunks])
         except httpx.TransportError as e:
+            finish(502, upstream_error=f"mid_stream_{type(e).__name__}")
             return JSONResponse(
                 status_code=502,
                 content={"error": {"message": f"Upstream stream broke mid-response ({type(e).__name__})",
@@ -370,13 +664,18 @@ async def chat_completions(request: Request):
             await resp.aclose()
             await client.aclose()
 
+        is_sse = "text/event-stream" in resp.headers.get("content-type", "")
+        completion = sse_to_completion(raw) if resp.status_code == 200 and is_sse else None
+        check_model(rec, (completion or {}).get("model") or model_from_bytes(raw[:8192]))
         resp_headers = {
             "X-RouteLLM-Choice": chosen,
             "X-RouteLLM-Latency": f"{latency_ms}ms",
             "X-RouteLLM-Attempts": str(attempt),
+            "X-RouteLLM-Source": rec.get("route_src", ""),
         }
-        is_sse = "text/event-stream" in resp.headers.get("content-type", "")
-        completion = sse_to_completion(raw) if resp.status_code == 200 and is_sse else None
+        if rec.get("resp_model"):
+            resp_headers["X-RouteLLM-Model"] = rec["resp_model"]
+        finish(resp.status_code)
         if completion is not None:
             return JSONResponse(completion, headers=resp_headers)
         return Response(
