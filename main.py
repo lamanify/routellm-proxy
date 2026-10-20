@@ -1,4 +1,4 @@
-import os, json, time, asyncio, httpx
+import os, json, time, asyncio, hashlib, httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response, JSONResponse
@@ -14,6 +14,11 @@ ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-inst
 FIRST_TOKEN_TIMEOUT = float(os.environ.get("FIRST_TOKEN_TIMEOUT", "60"))
 STALL_RETRIES = int(os.environ.get("STALL_RETRIES", "2"))
 STREAM_READ_TIMEOUT = float(os.environ.get("STREAM_READ_TIMEOUT", "180"))
+
+# An agent turn makes many calls that all end with the same user message; classify it once.
+ROUTE_CACHE_TTL = float(os.environ.get("ROUTE_CACHE_TTL", "1800"))
+ROUTE_CACHE_MAX = 5000
+route_cache: dict[str, tuple[str, float]] = {}
 
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
@@ -243,11 +248,21 @@ async def chat_completions(request: Request):
                             user_text += item.get("text", "") + " "
                 break
         
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            chosen, latency_ms = await classify_prompt_llm(client, user_text) if user_text else ("chat", 0.0)
+        key = hashlib.sha256(user_text.encode()).hexdigest()
+        cached = route_cache.get(key)
+        if cached and time.time() - cached[1] < ROUTE_CACHE_TTL:
+            chosen = cached[0]
+            print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: {chosen} (cached)")
+        else:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                chosen, latency_ms = await classify_prompt_llm(client, user_text) if user_text else ("chat", 0.0)
             print(f"[RouteLLM] Prompt: {user_text[:60]!r} -> Routed: {chosen} ({latency_ms}ms)")
-            body["model"] = chosen
-            
+            if len(route_cache) >= ROUTE_CACHE_MAX:
+                cutoff = time.time() - ROUTE_CACHE_TTL
+                for k in [k for k, (_, t) in route_cache.items() if t < cutoff] or list(route_cache)[:ROUTE_CACHE_MAX // 2]:
+                    del route_cache[k]
+            route_cache[key] = (chosen, time.time())
+
             # Non-blocking background log to Turso
             asyncio.create_task(
                 log_to_turso(
@@ -257,6 +272,7 @@ async def chat_completions(request: Request):
                     client_ip=request.client.host if request.client else ""
                 )
             )
+        body["model"] = chosen
 
     is_stream = bool(body.get("stream", False))
     headers = {
