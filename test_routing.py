@@ -55,6 +55,14 @@ class Prefilter(unittest.TestCase):
         self.assertEqual(main.prefilter("check this", 'PHP Fatal error: Uncaught Error in /var/www/a.php:64'), ("tier", "think"))
         self.assertEqual(main.prefilter("what is a stack trace", ""), None)
 
+class ConvKey(unittest.TestCase):
+    def test_stable_when_tail_of_system_prompt_changes(self):
+        a = main.conversation_key(msgs("audit it", system="You are Brew. " + "x" * 1200 + " time 10:00"))
+        b = main.conversation_key(msgs("audit it", "continue", system="You are Brew. " + "x" * 1200 + " time 10:05"))
+        self.assertEqual(a, b)
+    def test_differs_per_bot(self):
+        self.assertNotEqual(main.conversation_key(msgs("hi", system="You are Brew")), main.conversation_key(msgs("hi", system="You are Ops")))
+
 class Routing(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         main.route_cache.clear(); main.conv_state.clear(); main.stats.clear()

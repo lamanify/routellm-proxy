@@ -222,10 +222,13 @@ def prefilter(instruction: str, context: str) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 
 def conversation_key(messages: list) -> str:
-    """All requests arrive from one proxy IP, so identify a conversation from its body."""
+    """All requests arrive from one proxy IP, so identify a conversation from its body.
+
+    Only the start of the system prompt and of the first user message is hashed, so a timestamp or other
+    per-call text further down does not make every call look like a new conversation."""
     system = next((message_text(m) for m in messages if m.get("role") in ("system", "developer")), "")
     first_user = next((message_text(m) for m in messages if m.get("role") == "user"), "")
-    return hashlib.sha1(f"{system}\x00{first_user}".encode()).hexdigest()[:12]
+    return hashlib.sha1(f"{system[:1000]}\x00{first_user[:1000]}".encode()).hexdigest()[:12]
 
 def conv_last_tier(conv: str) -> str | None:
     entry = conv_state.get(conv)
