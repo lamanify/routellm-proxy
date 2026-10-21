@@ -25,6 +25,10 @@ HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "15"))
 CLASSIFIER_BUDGET = float(os.environ.get("CLASSIFIER_BUDGET", "1.5"))
 CLASSIFIER_TIMEOUT = float(os.environ.get("CLASSIFIER_TIMEOUT", "2.5"))
 CLASSIFIER_HEDGE = float(os.environ.get("CLASSIFIER_HEDGE", "1.0"))
+# Classifier latency grows with input size (measured: ~+1.3s at 120k chars, +3-5s at 250k), so it only
+# sees the start and end of a long instruction and the first CONTEXT_CHARS of the quoted parent.
+INSTRUCTION_CHARS = int(os.environ.get("CLASSIFIER_INSTRUCTION_CHARS", "1500"))
+CONTEXT_CHARS = int(os.environ.get("CLASSIFIER_CONTEXT_CHARS", "500"))
 DEFAULT_TIER = os.environ.get("DEFAULT_TIER", "chat")
 # Rule-based shortcuts (greetings, continuations, stack traces) that skip the LLM classifier.
 PREFILTER = os.environ.get("PREFILTER", "1") != "0"
@@ -254,11 +258,12 @@ def cache_put(key: str, tier: str):
 # ---------------------------------------------------------------------------
 
 def classifier_input(instruction: str, context: str) -> str:
-    if len(instruction) > 1500:
-        instruction = instruction[:1000] + " ... " + instruction[-400:]
+    if len(instruction) > INSTRUCTION_CHARS:
+        head = INSTRUCTION_CHARS * 2 // 3
+        instruction = instruction[:head] + " ... " + instruction[-(INSTRUCTION_CHARS - head):]
     text = f"Query: {instruction}"
     if context:
-        text += f"\nContext (the message being replied to): {context[:500]}"
+        text += f"\nContext (the message being replied to): {context[:CONTEXT_CHARS]}"
     return text
 
 async def classifier_call(instruction: str, context: str) -> tuple[str | None, str]:
@@ -338,7 +343,8 @@ async def run_classification(key: str, conv: str, instruction: str, context: str
             print(f"[RouteLLM] Classifier failed ({reason}) after {ms}ms, {attempts} attempt(s)")
         spawn(log_to_turso(preview, route or conv_last_tier(conv) or DEFAULT_TIER, ms, client_ip,
                            status="success" if route else "fallback",
-                           extra={"src": "llm" if route else "fallback", "reason": reason, "attempts": attempts}))
+                           extra={"src": "llm" if route else "fallback", "reason": reason, "attempts": attempts,
+                                  "input_chars": len(instruction) + len(context)}))
         return route, reason, ms, attempts
     finally:
         inflight.pop(key, None)
@@ -347,7 +353,8 @@ async def route_request(messages: list, client_ip: str = "") -> dict:
     """Pick a tier for a chat request. Never waits more than CLASSIFIER_BUDGET for the LLM."""
     conv = conversation_key(messages)
     last_user = next((message_text(m) for m in reversed(messages) if m.get("role") == "user"), "")
-    d = {"tier": DEFAULT_TIER, "src": "default", "reason": None, "classify_ms": 0.0, "conv": conv, "prompt": last_user[:60]}
+    d = {"tier": DEFAULT_TIER, "src": "default", "reason": None, "classify_ms": 0.0, "conv": conv, "prompt": last_user[:60],
+         "input_chars": len(last_user)}
     if not last_user.strip():
         return d
     if any(marker in last_user for marker in UNCLASSIFIED_CHAT_MARKERS):
@@ -585,7 +592,7 @@ async def chat_completions(request: Request):
         d = await route_request(body.get("messages") or [], request.client.host if request.client else "")
         chosen = d["tier"]
         rec.update(conv=d["conv"], tier=chosen, route_src=d["src"], fallback_reason=d["reason"] if d["src"] == "fallback" else None,
-                   classify_ms=d["classify_ms"], prompt=d["prompt"])
+                   classify_ms=d["classify_ms"], input_chars=d["input_chars"], prompt=d["prompt"])
         body["model"] = chosen
     else:
         rec.update(tier=model_req, route_src="explicit")

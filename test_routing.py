@@ -36,6 +36,15 @@ class Split(unittest.TestCase):
     def test_plain(self):
         self.assertEqual(main.split_message("audit the server"), ("audit the server", ""))
 
+class ClassifierInput(unittest.TestCase):
+    def test_long_instruction_truncated_to_head_and_tail(self):
+        text = main.classifier_input("A" * 1000 + "M" * 200000 + "Z" * 400, "c" * 5000)
+        self.assertLess(len(text), 2300)
+        self.assertIn("AAAA", text); self.assertIn("ZZZZ", text)
+    def test_huge_memory_context_never_reaches_classifier(self):
+        i, c = main.split_message("[Azri] where is the invoice?\n<memory-context>\n" + "x" * 200000 + "\n</memory-context>")
+        self.assertEqual((i, c), ("where is the invoice?", ""))
+
 class Prefilter(unittest.TestCase):
     def test_social(self):
         for t in ("hi", "Hello there Jason", "thanks a lot!", "ping", "thanks received", "ok thanks", "Got it 👍"):

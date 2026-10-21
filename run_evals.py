@@ -30,11 +30,17 @@ def pct(values, p):
     values = sorted(values)
     return values[min(len(values) - 1, int(len(values) * p))] if values else float("nan")
 
+def expand(user):
+    """A turn's `user` is a string, or {"parts": [str | {"repeat": str, "times": n}, ...]} for very long messages."""
+    if isinstance(user, str):
+        return user
+    return "".join(p if isinstance(p, str) else p["repeat"] * p["times"] for p in user["parts"])
+
 def run_case(case, system):
     turns = case.get("turns") or [{"user": case["prompt"], "expected": case["expected"]}]
     messages, results = [{"role": "system", "content": system}], []
     for turn in turns:
-        messages.append({"role": "user", "content": turn["user"]})
+        messages.append({"role": "user", "content": expand(turn["user"])})
         try:
             out = route(messages)
         except Exception as e:
@@ -42,7 +48,7 @@ def run_case(case, system):
         messages.append({"role": "assistant", "content": "ok"})
         if "expected" in turn:
             exp = turn["expected"] if isinstance(turn["expected"], list) else [turn["expected"]]
-            results.append((turn["user"], exp, out))
+            results.append((case.get("name") or expand(turn["user"]), exp, out))
     return results
 
 summary = {}
@@ -55,7 +61,7 @@ for suite in args.suite:
         for user, exp, out in run_case(case, f"eval-{RUN}-{suite}-{i}"):
             ok = out["route"] in exp
             rows.append((ok, out))
-            label = (case.get("name") or user)[:46].replace("\n", " ")
+            label = user[:46].replace("\n", " ")
             note = f" ({out['reason']})" if out.get("reason") else ""
             print(f"[{'PASS' if ok else 'FAIL'}] {label!r:50} expected {'/'.join(exp):13} got {out['route']:8} via {out['src']}{note} {out['wall_ms']:.0f}ms")
         if args.gap:

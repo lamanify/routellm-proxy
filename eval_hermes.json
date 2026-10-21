@@ -1,68 +1,348 @@
 [
-  {"name": "slack wrapper: thanks", "turns": [
-    {"user": "[Replying to: \"Here is the staging preview link\"]\n\n[Azri] thanks received", "expected": "routine"}]},
-  {"name": "slack wrapper: heavy instruction, trivial parent", "turns": [
-    {"user": "[Replying to: \"weekly report is out\"]\n\n[Azri] audit why the wordpress site keeps crashing with 502 errors and propose a recovery plan", "expected": "think"}]},
-  {"name": "slack wrapper: trivial instruction, heavy parent", "turns": [
-    {"user": "[Replying to: \"The prod database CPU is at 100% and replication broke after the migration, queries on wp_postmeta are timing out\"]\n\n[Azri] fix it", "expected": ["think", "chat"]}]},
-  {"name": "slack wrapper: one-line variant", "turns": [
-    {"user": "[Replying to: \"here is the invoice\"] [Azri] where do I find the invoice number?", "expected": "routine"}]},
-  {"name": "sender tag: greeting", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] hi", "expected": "routine"}]},
-  {"name": "sender tag: thanks", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] thanks!", "expected": "routine"}]},
-  {"name": "sender tag: heavy SEO check (was routine)", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] Check this https://klinikexample.com/ for SEO issues and broken links, crawl every page, fix whatever you find and report back. go", "expected": ["think", "chat"]}]},
-  {"name": "sender tag: copywriting", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] write a short LinkedIn post about our new clinic booking feature", "expected": "chat"}]},
-  {"name": "memory-context block must not influence", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] hi\n<memory-context>\nNotes: debugging a Redis replication buffer overrun, architecture review of the Kafka saga, disaster recovery plan for WordPress, audit of OAuth token exchange\n[System note: memory recalled]\n</memory-context>", "expected": "routine"}]},
-  {"name": "stack trace paste", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] PHP Fatal error:  Uncaught Error: Call to undefined function wc_get_cart() in /var/www/html/wp-content/plugins/woocommerce/includes/class-wc-session-handler.php:64\nStack trace:\n#0 /var/www/html/wp-settings.php(412): include_once()\n#1 {main}", "expected": "think"}]},
-  {"name": "check this + parent stack trace", "turns": [
-    {"user": "[Replying to: \"Fatal error: Uncaught TypeError in /var/www/html/wp-content/themes/divi/functions.php:88 Stack trace: #0 /var/www/html/wp-settings.php(412)\"]\n\n[Azri] check this", "expected": "think"}]},
-  {"name": "continue inherits think", "turns": [
-    {"user": "audit our cloudflare traefik ingress setup and identify potential SSL renegotiation flaws", "expected": "think"},
-    {"user": "continue", "expected": "think"}]},
-  {"name": "continue inherits chat (same words, other conversation)", "turns": [
-    {"user": "draft a polite response informing the client about project delay", "expected": "chat"},
-    {"user": "continue", "expected": "chat"}]},
-  {"name": "continue inherits routine", "turns": [
-    {"user": "what time is it in London?", "expected": "routine"},
-    {"user": "continue", "expected": "routine"}]},
-  {"name": "approval inherits think (wrapped)", "turns": [
-    {"user": "design a multi-tenant schema migration strategy with zero read downtime", "expected": "think"},
-    {"user": "[Replying to: \"Here is the migration plan, shall I apply it?\"]\n\n[Azri] approved, deploy it", "expected": "think"}]},
-  {"name": "approval inherits think (sender tag)", "turns": [
-    {"user": "debug this race condition where user sessions leak across browser tabs under high concurrency", "expected": "think"},
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] approved, deploy it", "expected": "think"}]},
-  {"name": "fix it inherits think", "turns": [
-    {"user": "find root cause of sporadic 502 Bad Gateway between Nginx and PHP-FPM upstream pool", "expected": "think"},
-    {"user": "fix it", "expected": "think"}]},
-  {"name": "thanks mid-thread is routine, then continue is think again", "turns": [
-    {"user": "perform an end-to-end security audit on our OAuth token exchange flow", "expected": "think"},
-    {"user": "thanks!", "expected": "routine"},
-    {"user": "continue", "expected": "think"}]},
-  {"name": "system note after think", "turns": [
-    {"user": "architect a distributed task queue with idempotency guarantees using Kafka and Postgres", "expected": "think"},
-    {"user": "[System note: The previous turn was interrupted by a gateway shutdown; the gateway is now back online. Any restart/shutdown commands...]", "expected": "think"}]},
-  {"name": "async delegation notice after chat", "turns": [
-    {"user": "summarize this customer feedback meeting transcript", "expected": "chat"},
-    {"user": "[ASYNC DELEGATION BATCH COMPLETE] 3 of 3 subagents finished. Results are below.", "expected": "chat"}]},
-  {"name": "tool iteration notice after think", "turns": [
-    {"user": "optimize this complex PostgreSQL query taking 14 seconds on a 20M row table", "expected": "think"},
-    {"user": "[Tool iteration limit notice: 58 of 60 iterations used. Wrap up.]", "expected": "think"}]},
-  {"name": "compaction handoff after think", "turns": [
-    {"user": "refactor our monolith checkout state machine into an event-driven saga pattern", "expected": "think"},
-    {"user": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff from a previous context window.", "expected": "think"}]},
-  {"name": "thread context + instruction", "turns": [
-    {"user": "[Thread context — prior messages in this thread (not yet in conversation history):]\n[thread parent] Azri: check latest email from Lan regarding migration\n\n[Azri | Slack user <@U0B9T9CF961>] where is the support email address?", "expected": ["routine", "chat"]}]},
-  {"name": "simple lookup", "turns": [
-    {"user": "[Azri | Slack user <@U0B9T9CF961>] check latest email from debi", "expected": ["routine", "chat"]}]},
-  {"name": "isolation A: continue after think", "turns": [
-    {"user": "diagnose why our Redis replica desyncs every 2 hours under write pressure", "expected": "think"},
-    {"user": "yes", "expected": "think"}]},
-  {"name": "isolation B: yes after routine", "turns": [
-    {"user": "ping", "expected": "routine"},
-    {"user": "yes", "expected": ["routine", "chat"]}]}
+ {
+  "name": "slack wrapper: thanks",
+  "turns": [
+   {
+    "user": "[Replying to: \"Here is the staging preview link\"]\n\n[Azri] thanks received",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "slack wrapper: heavy instruction, trivial parent",
+  "turns": [
+   {
+    "user": "[Replying to: \"weekly report is out\"]\n\n[Azri] audit why the wordpress site keeps crashing with 502 errors and propose a recovery plan",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "slack wrapper: trivial instruction, heavy parent",
+  "turns": [
+   {
+    "user": "[Replying to: \"The prod database CPU is at 100% and replication broke after the migration, queries on wp_postmeta are timing out\"]\n\n[Azri] fix it",
+    "expected": [
+     "think",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "slack wrapper: one-line variant",
+  "turns": [
+   {
+    "user": "[Replying to: \"here is the invoice\"] [Azri] where do I find the invoice number?",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "sender tag: greeting",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] hi",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "sender tag: thanks",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] thanks!",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "sender tag: heavy SEO check (was routine)",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] Check this https://klinikexample.com/ for SEO issues and broken links, crawl every page, fix whatever you find and report back. go",
+    "expected": [
+     "think",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "sender tag: copywriting",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] write a short LinkedIn post about our new clinic booking feature",
+    "expected": "chat"
+   }
+  ]
+ },
+ {
+  "name": "memory-context block must not influence",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] hi\n<memory-context>\nNotes: debugging a Redis replication buffer overrun, architecture review of the Kafka saga, disaster recovery plan for WordPress, audit of OAuth token exchange\n[System note: memory recalled]\n</memory-context>",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "stack trace paste",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] PHP Fatal error:  Uncaught Error: Call to undefined function wc_get_cart() in /var/www/html/wp-content/plugins/woocommerce/includes/class-wc-session-handler.php:64\nStack trace:\n#0 /var/www/html/wp-settings.php(412): include_once()\n#1 {main}",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "check this + parent stack trace",
+  "turns": [
+   {
+    "user": "[Replying to: \"Fatal error: Uncaught TypeError in /var/www/html/wp-content/themes/divi/functions.php:88 Stack trace: #0 /var/www/html/wp-settings.php(412)\"]\n\n[Azri] check this",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "continue inherits think",
+  "turns": [
+   {
+    "user": "audit our cloudflare traefik ingress setup and identify potential SSL renegotiation flaws",
+    "expected": "think"
+   },
+   {
+    "user": "continue",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "continue inherits chat (same words, other conversation)",
+  "turns": [
+   {
+    "user": "draft a polite response informing the client about project delay",
+    "expected": "chat"
+   },
+   {
+    "user": "continue",
+    "expected": "chat"
+   }
+  ]
+ },
+ {
+  "name": "continue inherits routine",
+  "turns": [
+   {
+    "user": "what time is it in London?",
+    "expected": "routine"
+   },
+   {
+    "user": "continue",
+    "expected": "routine"
+   }
+  ]
+ },
+ {
+  "name": "approval inherits think (wrapped)",
+  "turns": [
+   {
+    "user": "design a multi-tenant schema migration strategy with zero read downtime",
+    "expected": "think"
+   },
+   {
+    "user": "[Replying to: \"Here is the migration plan, shall I apply it?\"]\n\n[Azri] approved, deploy it",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "approval inherits think (sender tag)",
+  "turns": [
+   {
+    "user": "debug this race condition where user sessions leak across browser tabs under high concurrency",
+    "expected": "think"
+   },
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] approved, deploy it",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "fix it inherits think",
+  "turns": [
+   {
+    "user": "find root cause of sporadic 502 Bad Gateway between Nginx and PHP-FPM upstream pool",
+    "expected": "think"
+   },
+   {
+    "user": "fix it",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "thanks mid-thread is routine, then continue is think again",
+  "turns": [
+   {
+    "user": "perform an end-to-end security audit on our OAuth token exchange flow",
+    "expected": "think"
+   },
+   {
+    "user": "thanks!",
+    "expected": "routine"
+   },
+   {
+    "user": "continue",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "system note after think",
+  "turns": [
+   {
+    "user": "architect a distributed task queue with idempotency guarantees using Kafka and Postgres",
+    "expected": "think"
+   },
+   {
+    "user": "[System note: The previous turn was interrupted by a gateway shutdown; the gateway is now back online. Any restart/shutdown commands...]",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "async delegation notice after chat",
+  "turns": [
+   {
+    "user": "summarize this customer feedback meeting transcript",
+    "expected": "chat"
+   },
+   {
+    "user": "[ASYNC DELEGATION BATCH COMPLETE] 3 of 3 subagents finished. Results are below.",
+    "expected": "chat"
+   }
+  ]
+ },
+ {
+  "name": "tool iteration notice after think",
+  "turns": [
+   {
+    "user": "optimize this complex PostgreSQL query taking 14 seconds on a 20M row table",
+    "expected": "think"
+   },
+   {
+    "user": "[Tool iteration limit notice: 58 of 60 iterations used. Wrap up.]",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "compaction handoff after think",
+  "turns": [
+   {
+    "user": "refactor our monolith checkout state machine into an event-driven saga pattern",
+    "expected": "think"
+   },
+   {
+    "user": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff from a previous context window.",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "thread context + instruction",
+  "turns": [
+   {
+    "user": "[Thread context — prior messages in this thread (not yet in conversation history):]\n[thread parent] Azri: check latest email from Lan regarding migration\n\n[Azri | Slack user <@U0B9T9CF961>] where is the support email address?",
+    "expected": [
+     "routine",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "simple lookup",
+  "turns": [
+   {
+    "user": "[Azri | Slack user <@U0B9T9CF961>] check latest email from debi",
+    "expected": [
+     "routine",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "isolation A: continue after think",
+  "turns": [
+   {
+    "user": "diagnose why our Redis replica desyncs every 2 hours under write pressure",
+    "expected": "think"
+   },
+   {
+    "user": "yes",
+    "expected": "think"
+   }
+  ]
+ },
+ {
+  "name": "isolation B: yes after routine",
+  "turns": [
+   {
+    "user": "ping",
+    "expected": "routine"
+   },
+   {
+    "user": "yes",
+    "expected": [
+     "routine",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "huge memory-context block (200k chars) + simple lookup",
+  "turns": [
+   {
+    "user": {
+     "parts": [
+      "[Azri | Slack user <@U0B9T9CF961>] where can I find the support email address?\n<memory-context>\n",
+      {
+       "repeat": "Notes about migrations, audits and architecture reviews. ",
+       "times": 3500
+      },
+      "\n</memory-context>"
+     ]
+    },
+    "expected": [
+     "routine",
+     "chat"
+    ]
+   }
+  ]
+ },
+ {
+  "name": "huge pasted log (150k chars) + debug request",
+  "turns": [
+   {
+    "user": {
+     "parts": [
+      "[Azri | Slack user <@U0B9T9CF961>] please debug why the checkout keeps failing, log below:\n",
+      {
+       "repeat": "2026-10-20 12:00:01 ERROR wc_session_handler: cannot write session row, deadlock found when trying to get lock\n",
+       "times": 1500
+      }
+     ]
+    },
+    "expected": [
+     "think",
+     "chat"
+    ]
+   }
+  ]
+ }
 ]
