@@ -216,7 +216,7 @@
   "name": "async delegation notice after chat",
   "turns": [
    {
-    "user": "summarize this customer feedback meeting transcript",
+    "user": "draft a polite response informing the client about project delay",
     "expected": "chat"
    },
    {

@@ -48,3 +48,20 @@ python -m unittest -v test_routing                 # offline: parsing, prefilter
 python run_evals.py --url http://localhost:6060    # classifier-only: eval_suite.json + eval_hermes.json, accuracy and p50/p90
 ```
 `run_evals.py` needs a running proxy that can reach Nexus (`NEXUS_API_KEY`); it never runs a completion.
+
+## Notes on classifier latency (measured 2026-10-21)
+- A keep-warm ping was tested and **not** shipped: with synthetic prompts from 70 to 20,000 characters the classifier answered in
+  0.4-1.4s after idle gaps of 2, 3, 5, 10 and 15 minutes, the same as a few seconds later, with and without a 30s ping.
+- What did correlate with slow classifications in production was input size: ~0.5s at 2k chars, ~1.8s at 120k, 3.6-6s at 250k.
+  Hermes' wrapped messages (memory-context, thread context, compaction summaries) are long, so the classifier input is now the
+  stripped instruction capped at `CLASSIFIER_INSTRUCTION_CHARS` plus `CLASSIFIER_CONTEXT_CHARS` of the quoted parent.
+  Each request logs `input_chars` so this can be confirmed on real traffic.
+- The classifier hop occasionally stalls for seconds (all four probes of one burst timed out at 12s): the wait budget, hedge and
+  last-tier fallback exist for that.
+
+### If the Nexus -> CLD -> Cloudflare chain stays the weak point
+Calling Cloudflare Workers AI directly removes two hops. It needs, from the user: a Cloudflare **account id** and an **API token**
+with the Workers AI permission (`CF_ACCOUNT_ID`, `CF_API_TOKEN` env vars). The call would be
+`POST https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/ai/run/@cf/meta/llama-3.1-8b-instruct-fp8-fast`
+(or the OpenAI-compatible `/ai/v1/chat/completions`) with the same system prompt. Not implemented; the free-tier daily
+neuron allowance and per-request rate limits would have to be checked against the classification volume first.
