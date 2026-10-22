@@ -17,6 +17,32 @@ STREAM_READ_TIMEOUT = float(os.environ.get("STREAM_READ_TIMEOUT", "180"))
 # If an attempt has no first chunk after HEDGE_AFTER seconds, start the next one alongside it
 # and keep whichever answers first (0 disables hedging).
 HEDGE_AFTER = float(os.environ.get("HEDGE_AFTER", "15"))
+# Very large requests (long agent sessions) can legitimately think for over a minute before the
+# first chunk; give them FIRST_TOKEN_TIMEOUT_LARGE instead of killing healthy-but-slow attempts.
+FIRST_TOKEN_TIMEOUT_LARGE = float(os.environ.get("FIRST_TOKEN_TIMEOUT_LARGE", "120"))
+LARGE_REQUEST_CHARS = int(os.environ.get("LARGE_REQUEST_CHARS", "150000"))
+# Hermes's continuation nudge after an output-cap truncation. Route it to the tier with the
+# largest output budget: inheriting a low-thinking tier (8k cap) cannot finish a long answer.
+TRUNCATION_MARKER = "[System: Your previous response was truncated"
+TRUNCATION_TIER = os.environ.get("TRUNCATION_TIER", "think")
+
+
+def request_chars(body: dict) -> int:
+    """Approximate request size: total characters of message content (text parts only)."""
+    total = 0
+    for m in body.get("messages") or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            total += sum(len(p.get("text") or "") for p in c if isinstance(p, dict))
+    return total
+
+
+def first_token_timeout(body: dict) -> float:
+    if request_chars(body) >= LARGE_REQUEST_CHARS:
+        return max(FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_TIMEOUT_LARGE)
+    return FIRST_TOKEN_TIMEOUT
 
 # Classifier: a request waits at most CLASSIFIER_BUDGET seconds for the route, then uses the
 # conversation's last tier (DEFAULT_TIER if none) while the classification finishes in the
@@ -359,6 +385,8 @@ async def route_request(messages: list, client_ip: str = "") -> dict:
         return d
     if any(marker in last_user for marker in UNCLASSIFIED_CHAT_MARKERS):
         return {**d, "tier": "chat", "src": "background"}
+    if last_user.lstrip().startswith(TRUNCATION_MARKER) and TRUNCATION_TIER in TIERS:
+        return {**d, "tier": TRUNCATION_TIER, "src": "rule", "reason": "truncation_continuation"}
 
     previous = conv_last_tier(conv)
     if CONTEXT_ROUTING:
@@ -410,7 +438,7 @@ def start_attempt(body: dict, headers: dict, attempt: int) -> dict:
         chunks = state["resp"].aiter_raw()
         return chunks, await anext(chunks, b"")
 
-    state["task"] = asyncio.create_task(asyncio.wait_for(first_chunk(), FIRST_TOKEN_TIMEOUT))
+    state["task"] = asyncio.create_task(asyncio.wait_for(first_chunk(), first_token_timeout(body)))
     return state
 
 async def close_attempt(state: dict):
@@ -471,7 +499,7 @@ def stall_error(e: Exception, chosen: str) -> JSONResponse:
     return JSONResponse(
         status_code=504 if timed_out else 502,
         content={"error": {
-            "message": f"Upstream gave no first chunk within {FIRST_TOKEN_TIMEOUT:.0f}s "
+            "message": f"Upstream gave no first chunk within the first-token timeout "
                        f"on {1 + STALL_RETRIES} attempts ({type(e).__name__})",
             "type": "upstream_timeout" if timed_out else "upstream_error",
         }},

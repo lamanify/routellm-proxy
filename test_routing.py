@@ -151,3 +151,20 @@ class Routing(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLamanifyTruncationAndTimeout(unittest.TestCase):
+    def test_truncation_continuation_goes_to_think(self):
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "build the page"},
+                {"role": "assistant", "content": "partial..."},
+                {"role": "user", "content": "[System: Your previous response was truncated by the output length limit. Continue exactly where you left off.]"}]
+        d = asyncio.run(main.route_request(msgs))
+        self.assertEqual(d["tier"], "think"); self.assertEqual(d["src"], "rule")
+
+    def test_first_token_timeout_scales_with_size(self):
+        small = {"messages": [{"role": "user", "content": "hi"}]}
+        large = {"messages": [{"role": "user", "content": "x" * (main.LARGE_REQUEST_CHARS + 1)}]}
+        parts = {"messages": [{"role": "user", "content": [{"type": "text", "text": "y" * (main.LARGE_REQUEST_CHARS + 1)}]}]}
+        self.assertEqual(main.first_token_timeout(small), main.FIRST_TOKEN_TIMEOUT)
+        self.assertEqual(main.first_token_timeout(large), max(main.FIRST_TOKEN_TIMEOUT, main.FIRST_TOKEN_TIMEOUT_LARGE))
+        self.assertEqual(main.first_token_timeout(parts), max(main.FIRST_TOKEN_TIMEOUT, main.FIRST_TOKEN_TIMEOUT_LARGE))
