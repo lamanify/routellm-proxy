@@ -25,6 +25,8 @@ LARGE_REQUEST_CHARS = int(os.environ.get("LARGE_REQUEST_CHARS", "150000"))
 # largest output budget: inheriting a low-thinking tier (8k cap) cannot finish a long answer.
 TRUNCATION_MARKER = "[System: Your previous response was truncated"
 TRUNCATION_TIER = os.environ.get("TRUNCATION_TIER", "think")
+# Hermes compaction handoff markers (agent/context_compressor.py) that start a compacted session.
+COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[PRIOR CONTEXT")
 
 
 def request_chars(body: dict) -> int:
@@ -258,7 +260,12 @@ def conversation_key(messages: list) -> str:
     per-call text further down does not make every call look like a new conversation."""
     system = next((message_text(m) for m in messages if m.get("role") in ("system", "developer")), "")
     first_user = next((message_text(m) for m in messages if m.get("role") == "user"), "")
-    return hashlib.sha1(f"{system[:1000]}\x00{first_user[:1000]}".encode()).hexdigest()[:12]
+    # After a Hermes compaction the first user message is a fixed preamble (>1000 chars) plus the
+    # session's own summary, so its first 1000 chars are identical for every compacted session of a
+    # bot. Hash the whole message there: the summary is unique per session and stable until the
+    # next compaction.
+    head = first_user if first_user.startswith(COMPACTION_PREFIXES) else first_user[:1000]
+    return hashlib.sha1(f"{system[:1000]}\x00{head}".encode()).hexdigest()[:12]
 
 def conv_last_tier(conv: str) -> str | None:
     entry = conv_state.get(conv)

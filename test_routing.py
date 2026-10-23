@@ -71,6 +71,13 @@ class ConvKey(unittest.TestCase):
         self.assertEqual(a, b)
     def test_differs_per_bot(self):
         self.assertNotEqual(main.conversation_key(msgs("hi", system="You are Brew")), main.conversation_key(msgs("hi", system="You are Ops")))
+    def test_compacted_sessions_of_one_bot_stay_apart(self):
+        pre = "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted. " + "p" * 1500
+        a = main.conversation_key(msgs(pre + "\nSummary: client A website", "next", system="You are Kayla"))
+        b = main.conversation_key(msgs(pre + "\nSummary: client B ads", "next", system="You are Kayla"))
+        a2 = main.conversation_key(msgs(pre + "\nSummary: client A website", "next", "more", system="You are Kayla"))
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, a2)
 
 class Routing(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
