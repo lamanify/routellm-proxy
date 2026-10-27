@@ -8,6 +8,14 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
 ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast")
+# Primary classifier: Jev (TypeSafe decisions model) via OpenRouter's decisions endpoint. It returns one
+# typed label with a confidence; errors and low-confidence answers fall back to the ROUTER_MODEL LLM.
+# Without OPENROUTER_API_KEY the LLM classifier is used alone.
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.14")
+JEV_URL = os.environ.get("JEV_URL", "https://openrouter.ai/api/alpha/decisions")
+JEV_MIN_CONFIDENCE = float(os.environ.get("JEV_MIN_CONFIDENCE", "0.35"))
+USE_JEV = bool(OPENROUTER_KEY) and os.environ.get("CLASSIFIER_BACKEND", "jev") == "jev"
 
 # Upstream sometimes accepts a streaming request and then sends nothing for minutes.
 # Give each attempt FIRST_TOKEN_TIMEOUT seconds to produce its first chunk, then retry.
@@ -95,6 +103,16 @@ Judge by how much work the request implies, not by how short it is. A context li
 
 Return JSON: {"route": "routine"|"chat"|"think"}"""
 
+# The same tiers as a Jev Choice question (option name -> description).
+JEV_INSTRUCTIONS = ("How much work does the user's request imply? Judge by how much work it implies, not by how "
+                    "short it is. A context line, if present, is only the message being replied to.")
+JEV_CRITERIA = {
+    "routine": "greetings, thanks, simple acknowledgments, pings, simple lookups of a link, status or fact",
+    "chat": "standard chat, explanations, copywriting, typical tasks",
+    "think": "audits, architecture, code debugging, disaster recovery plans, troubleshooting complex errors, and "
+             "requests to check, crawl, test or review many pages or systems or to carry out multi-step work",
+}
+
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-encoding", "content-length"
@@ -117,7 +135,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
         await http.aclose()
 
-app = FastAPI(title="RouteLLM Proxy", version="1.5.0", lifespan=lifespan)
+app = FastAPI(title="RouteLLM Proxy", version="1.6.0", lifespan=lifespan)
 
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
@@ -299,8 +317,49 @@ def classifier_input(instruction: str, context: str) -> str:
         text += f"\nContext (the message being replied to): {context[:CONTEXT_CHARS]}"
     return text
 
+async def jev_call(instruction: str, context: str) -> tuple[str | None, float, str]:
+    """One Jev decision. Returns (route, confidence, "ok") or (None, 0.0, reason)."""
+    try:
+        resp = await http.post(
+            JEV_URL,
+            headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
+            json={"model": JEV_MODEL, "state": classifier_input(instruction, context),
+                  "questions": {"route": {"type": "choice", "instructions": JEV_INSTRUCTIONS, "criteria": JEV_CRITERIA}}},
+            timeout=CLASSIFIER_TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        return None, 0.0, "jev_timeout"
+    except httpx.HTTPError as e:
+        return None, 0.0, f"jev_transport_{type(e).__name__}"
+    if resp.status_code != 200:
+        return None, 0.0, f"jev_http_{resp.status_code}"
+    try:
+        answer = resp.json()["answers"]["route"]
+        route, confidence = str(answer["choice"]).lower().strip(), float(answer.get("confidence") or 0.0)
+    except (ValueError, KeyError, TypeError):
+        return None, 0.0, "jev_invalid"
+    return (route, confidence, "ok") if route in TIERS else (None, 0.0, "jev_invalid_route")
+
 async def classifier_call(instruction: str, context: str) -> tuple[str | None, str]:
-    """One classifier request. Returns (route, "ok") or (None, reason)."""
+    """One classification: Jev first when configured; the LLM classifier answers when Jev fails or is unsure
+    (confidence below JEV_MIN_CONFIDENCE). An unsure Jev answer still beats no answer."""
+    if not USE_JEV:
+        return await llm_call(instruction, context)
+    route, confidence, reason = await jev_call(instruction, context)
+    if route and confidence >= JEV_MIN_CONFIDENCE:
+        stats["classifier_jev"] += 1
+        return route, "ok"
+    llm_route, llm_reason = await llm_call(instruction, context)
+    if llm_route:
+        stats["classifier_llm_after_" + ("jev_unsure" if route else reason)] += 1
+        return llm_route, "ok"
+    if route:
+        stats["classifier_jev_unsure_kept"] += 1
+        return route, "ok"
+    return None, f"{reason}+{llm_reason}"
+
+async def llm_call(instruction: str, context: str) -> tuple[str | None, str]:
+    """One LLM classifier request. Returns (route, "ok") or (None, reason)."""
     try:
         resp = await http.post(
             f"{UPSTREAM}/chat/completions",

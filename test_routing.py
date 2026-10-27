@@ -1,6 +1,7 @@
 """Offline tests for message parsing, the prefilter and the classifier budget: python -m unittest -v"""
 import asyncio, unittest
 import main
+REAL_CLASSIFIER_CALL = main.classifier_call  # other tests replace main.classifier_call
 
 def msgs(*turns, system="sys"):
     out = [{"role": "system", "content": system}]
@@ -155,6 +156,41 @@ class Routing(unittest.IsolatedAsyncioTestCase):
     async def test_wrapper_context_used_for_bare_approval(self):
         d = await main.route_request(msgs('[Replying to: "prod db CPU at 100%"]\n\n[Azri] yes'))
         self.assertEqual(self.calls[0], ("yes", "prod db CPU at 100%"))
+
+class JevClassifier(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.saved = (main.USE_JEV, main.jev_call, main.llm_call)
+        main.USE_JEV = True
+        main.stats.clear()
+        self.llm_calls = 0
+    def tearDown(self):
+        main.USE_JEV, main.jev_call, main.llm_call = self.saved
+    def use(self, jev, llm):
+        async def fake_jev(instruction, context): return jev
+        async def fake_llm(instruction, context):
+            self.llm_calls += 1
+            return llm
+        main.jev_call, main.llm_call = fake_jev, fake_llm
+    async def test_confident_jev_skips_llm(self):
+        self.use(("think", 0.9, "ok"), ("chat", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("audit 40 pages", ""), ("think", "ok"))
+        self.assertEqual(self.llm_calls, 0)
+    async def test_jev_error_falls_back_to_llm(self):
+        self.use((None, 0.0, "jev_http_503"), ("chat", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("explain caching", ""), ("chat", "ok"))
+        self.assertEqual(main.stats["classifier_llm_after_jev_http_503"], 1)
+    async def test_unsure_jev_asks_llm_then_keeps_jev_if_llm_fails(self):
+        self.use(("routine", 0.2, "ok"), ("think", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("hmm", ""), ("think", "ok"))
+        self.use(("routine", 0.2, "ok"), (None, "http_503"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("hmm", ""), ("routine", "ok"))
+    async def test_both_fail(self):
+        self.use((None, 0.0, "jev_timeout"), (None, "http_503"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("x", ""), (None, "jev_timeout+http_503"))
+    async def test_without_key_uses_llm_only(self):
+        main.USE_JEV = False
+        self.use(("think", 0.99, "ok"), ("chat", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("x", ""), ("chat", "ok"))
 
 if __name__ == "__main__":
     unittest.main()
