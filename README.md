@@ -37,6 +37,7 @@ Responses carry `X-RouteLLM-Choice|Source|Latency|Attempts|Model`.
 | `DEFAULT_TIER` | chat | tier when nothing is known |
 | `PREFILTER` / `CONTEXT_ROUTING` | 1 / 1 | `0` turns the rule prefilter / wrapper parsing + inheritance off |
 | `ROUTE_CACHE_TTL` / `CONV_TTL` | 1800 / 21600 s | |
+| `ROUTINE_FLOOR` | 1 | inside a conversation on chat/think, a classified message goes no lower than chat (`0` = off) |
 | `EXPECTED_MODEL_SUBSTR` | gemini | `""` disables the model warning |
 | `MODELS_CACHE_TTL` | 60 s | |
 | `FIRST_TOKEN_TIMEOUT`, `STALL_RETRIES`, `HEDGE_AFTER`, `STREAM_READ_TIMEOUT` | 60 / 2 / 15 / 180 | upstream stall handling |

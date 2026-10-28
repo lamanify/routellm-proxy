@@ -55,6 +55,21 @@ class Split(unittest.TestCase):
         tail = "Do not guess a reply destination when these fields are insufficient."
         self.assertEqual(main.split_message(f"{head}\n{tail}\n\nin bukku"), ("in bukku", ""))
         self.assertEqual(main.split_message(f"{head} {tail} it is rented"), ("it is rented", ""))
+    def test_more_agent_notices(self):
+        for n in ("[IMPORTANT: 2 background subagent delegations completed for this session. Treat these results as one]\n\nresult",
+                  "[IMPORTANT: Background process proc_1 matched watch pattern \"done\".\nCommand: x]",
+                  "[Background process proc_962adb51ff35 heartbeat #3 — still running after 3m (next in 60s).\nCommand: x]",
+                  "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response",
+                  "Continue from the compressed conversation context above. This marker exists because"):
+            self.assertEqual(main.split_message(n), ("", ""), n)
+        self.assertEqual(main.split_message("[IMPORTANT] fix the header")[0], "fix the header")  # a tag, not a notice
+
+    def test_data_block_removed(self):
+        t = "yes\n\n\n\n=== TURSO PREFLIGHT (deterministic, past 30d) ===\nrows: 12\nposts: 4\n=== END TURSO PREFLIGHT ==="
+        self.assertEqual(main.split_message(t)[0], "yes")
+        t = "fix the header\n=== NOTES ===\nkeep this, no end marker"
+        self.assertEqual(main.split_message(t)[0], t)
+
     def test_image_description_removed(self):
         t = ('[Replying to: "Access the clinic site"]\n\n[The user sent an image~ Here\'s what I can see:\nA hero with "quotes"] '
              'and brackets.\n~]\n\n[Azri] make the CTA bigger')
@@ -157,9 +172,9 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         d = await main.route_request(msgs("audit the ingress setup", "something ambiguous here"))
         self.assertEqual((d["tier"], d["src"], d["reason"]), ("think", "fallback", "timeout"))
         self.assertEqual(main.stats["fallback_timeout"], 1)
-        self.result = ("routine", "ok")
+        self.result = ("chat", "ok")
         d = await main.route_request(msgs("audit the ingress setup", "something ambiguous here"))
-        self.assertEqual((d["tier"], d["src"]), ("routine", "llm"))
+        self.assertEqual((d["tier"], d["src"]), ("chat", "llm"))
 
     async def test_concurrent_same_message_single_call(self):
         self.delay = 0.1
@@ -183,6 +198,40 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((d["tier"], d["src"], d["reason"]), ("think", "inherit", "continuation"))
         d = await main.route_request(msgs("summarise the thread", "the second one", system="other"))
         self.assertEqual((d["tier"], d["src"]), ("routine", "inherit"))  # no history: Jev's own tier
+
+    async def test_routine_floor_inside_a_working_conversation(self):
+        await main.route_request(msgs("audit the ingress setup"))
+        self.result = ("routine", "ok")
+        d = await main.route_request(msgs("audit the ingress setup", "have you done the rest?"))
+        self.assertEqual((d["tier"], d["src"], d["reason"]), ("chat", "llm", "floor"))
+        self.assertEqual(main.stats["classifier_floor"], 1)
+        d = await main.route_request(msgs("audit the ingress setup", "have you done the rest?"))
+        self.assertEqual((d["tier"], d["src"]), ("chat", "cache"))
+        d = await main.route_request(msgs("audit the ingress setup", "have you done the rest?", "thanks"))
+        self.assertEqual((d["tier"], d["src"]), ("routine", "rule"))  # social messages are not floored
+
+    async def test_routine_floor_needs_a_working_conversation(self):
+        self.result = ("routine", "ok")
+        d = await main.route_request(msgs("give me the staging link"))
+        self.assertEqual((d["tier"], d["src"]), ("routine", "llm"))
+        d = await main.route_request(msgs("give me the staging link", "and the prod link?"))
+        self.assertEqual(d["tier"], "routine")  # the conversation is on routine: no floor
+
+    async def test_routine_floor_can_be_disabled(self):
+        await main.route_request(msgs("audit the ingress setup"))
+        self.result = ("routine", "ok"); main.ROUTINE_FLOOR = False
+        try:
+            d = await main.route_request(msgs("audit the ingress setup", "have you done the rest?"))
+        finally:
+            main.ROUTINE_FLOOR = True
+        self.assertEqual(d["tier"], "routine")
+
+    async def test_image_description_calls_are_not_classified(self):
+        for p in ("Fully describe and explain everything about this image, then answer the following question:\n\nwhat is it?",
+                  "Concisely describe this image in 2-4 sentences (~200 Chinese characters or ~150 English words)."):
+            d = await main.route_request(msgs(p))
+            self.assertEqual((d["tier"], d["src"]), ("chat", "background"))
+        self.assertEqual(self.calls, [])
 
     async def test_wrapper_context_used_for_bare_approval(self):
         d = await main.route_request(msgs('[Replying to: "prod db CPU at 100%"]\n\n[Azri] yes'))

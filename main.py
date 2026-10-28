@@ -20,6 +20,11 @@ JEV_MIN_CONFIDENCE = float(os.environ.get("JEV_MIN_CONFIDENCE", "0"))
 # A message Jev rates at least this likely to be a bare continuation ("ya", "option 2", a value the agent asked
 # for) keeps the conversation's last tier, like the prefilter's continuation words.
 JEV_CONTINUATION = float(os.environ.get("JEV_CONTINUATION", "0.7"))
+# Inside a conversation already on chat or think, a classified message goes no lower than chat. Live traffic
+# showed Jev reading follow-ups on unfinished work ("have you done the rest?", "X is still the same", "check
+# again") as status lookups; each such miss ran a whole agent turn (45-90 calls) on the routine model, while
+# the floor's cost is one chat call for a real lookup. Social messages still go to routine via the prefilter.
+ROUTINE_FLOOR = os.environ.get("ROUTINE_FLOOR", "1") != "0"
 USE_JEV = bool(OPENROUTER_KEY) and os.environ.get("CLASSIFIER_BACKEND", "jev") == "jev"
 
 # Upstream sometimes accepts a streaming request and then sends nothing for minutes.
@@ -96,6 +101,9 @@ background: set[asyncio.Task] = set()
 stats: Counter = Counter()
 # Hermes background prompts (skill review, compression) go to "chat" without classifying.
 UNCLASSIFIED_CHAT_MARKERS = ("Review the conversation above", "summarization agent")
+# Hermes' image-description calls (tools/vision_tools.py, gateway/run_inbound.py) also go to "chat" unclassified.
+UNCLASSIFIED_CHAT_PREFIXES = ("Fully describe and explain everything about this image",
+                              "Concisely describe this image in 2-4 sentences")
 
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
@@ -126,20 +134,25 @@ JEV_CRITERIA = {
                 "reply, or one simple lookup that returns a single link, status, date or fact (for example whether "
                 "a reply or email has arrived).",
         "not_for": "Requests to change, add, remove, fix, write, draft, explain, analyse, plan or test anything, "
-                   "however short, and questions that ask for the assistant's judgment or ask it to try something.",
+                   "however short, and questions that ask for the assistant's judgment or ask it to try something. "
+                   "Follow-ups on earlier work are not lookups either: asking whether the requested changes are "
+                   "done, saying something is still wrong or unchanged, or asking to check or re-check a page, a "
+                   "site or the assistant's work.",
         "examples": ["thanks, noted", "give me the staging link", "any reply from the client yet?",
                      "is the site up now?", "ok terima kasih"],
     },
     "chat": {
         "what": "One bounded task: answer a question or give an opinion, explain something, write or draft copy, a "
-                "post or an email, summarise, or make one specific edit such as changing a link, text, colour, "
-                "spacing, image or setting.",
+                "post or an email, summarise, make one specific edit such as changing a link, text, colour, "
+                "spacing, image or setting, or follow up on earlier work: finish what is left, look again at "
+                "something still wrong, or check a page or the work done.",
         "not_for": "Pure acknowledgments and one-fact lookups (routine). Finding out why something is broken or "
                    "slow, audits, plans, building new pages or workflows, tests, or work across many pages or "
                    "systems (think).",
         "examples": ["redirect the hero button to WhatsApp", "draft a follow-up email to the client",
                      "explain how this pricing works", "add more padding under the hero section",
-                     "tolong tukar warna butang jadi hijau"],
+                     "tolong tukar warna butang jadi hijau", "what about the other changes I asked for, done yet?",
+                     "the about page still shows the old photo", "check again"],
     },
     "think": {
         "what": "Heavy or multi-step work: finding out why something is broken, wrong or slow and fixing it, audits "
@@ -194,7 +207,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
         await http.aclose()
 
-app = FastAPI(title="RouteLLM Proxy", version="1.7.0", lifespan=lifespan)
+app = FastAPI(title="RouteLLM Proxy", version="1.7.1", lifespan=lifespan)
 
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
@@ -270,11 +283,21 @@ NOTICE_RE = re.compile(
     r"|[^\]\n]{0,60}\b(?:tool[- ]iteration|iteration (?:limit|budget)|max(?:imum)? iterations))", re.I)
 # Agent notices that Hermes can prefix with a sender tag ("[Azri] [ASYNC DELEGATION ..."). Narrower than
 # NOTICE_RE because it is also tried on the user's own words.
-AGENT_NOTICE_RE = re.compile(r"^\s*\[(?:ASYNC DELEGATION|CONTEXT COMPACTION|STILL IN PROGRESS|Context from the interrupted)", re.I)
+# Includes the background-process and subagent-batch notices (tools/process_registry_notifications.py,
+# gateway/run_notifications.py).
+AGENT_NOTICE_RE = re.compile(
+    r"^\s*\[(?:ASYNC DELEGATION|CONTEXT COMPACTION|STILL IN PROGRESS|Context from the interrupted"
+    r"|IMPORTANT: (?:\d+ background subagent delegations completed|Background process )"
+    r"|Background process \S+ heartbeat #)", re.I)
+# Agent messages without a leading bracket (agent/context_compressor.py).
+AGENT_TEXT_NOTICES = ("You've reached the maximum number of tool-calling iterations",
+                      "Continue from the compressed conversation context above")
 # Not the user's words either: the gateway's origin header (one JSON line for the agent) and the vision
 # preprocessor's image descriptions (up to thousands of characters, placed before the user's text).
 GATEWAY_RE = re.compile(r"Gateway message origin \(JSON data[^\n]*\n\s*\{[^{}\n]*\}[ \t]*\n?(?:[ \t]*Do not guess a reply destination[^.\n]*\.)?")
 IMAGE_RE = re.compile(r"\[The user sent an image~ Here's what I can see:.*?~\]", re.S)
+# Data blocks that bot scripts append to messages ("=== TURSO PREFLIGHT (...) === ... === END TURSO PREFLIGHT ===").
+DATA_BLOCK_RE = re.compile(r"^=== ([A-Z][A-Z ]{2,40}?)(?: \([^)\n]*\))? ===\n.*?^=== END \1 ===[ \t]*$", re.S | re.M)
 REPLY_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>.*)$', re.S)
 REPLY_WITH_SENDER_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>\[[^\]\n]{1,80}\].*)$', re.S)
 SENDER_RE = re.compile(r"^\s*\[[^\]\n|]{1,60}(?:\s*\|\s*Slack user\s*<@\w+>)?\]\s*")
@@ -285,8 +308,8 @@ NEW_MESSAGE_RE = re.compile(r"^\s*\[New message\]\s*")
 
 def split_message(text: str) -> tuple[str, str]:
     """Return (instruction, context). instruction == "" means the message carries no new request."""
-    text = IMAGE_RE.sub("", GATEWAY_RE.sub("", MEMORY_RE.sub("", text))).strip()
-    if NOTICE_RE.match(text) or AGENT_NOTICE_RE.match(SENDER_RE.sub("", text, count=1)):
+    text = DATA_BLOCK_RE.sub("", IMAGE_RE.sub("", GATEWAY_RE.sub("", MEMORY_RE.sub("", text)))).strip()
+    if NOTICE_RE.match(text) or AGENT_NOTICE_RE.match(SENDER_RE.sub("", text, count=1)) or text.startswith(AGENT_TEXT_NOTICES):
         return "", ""
     text = SYSTEM_NOTE_RE.sub("", text).strip()
     context = ""
@@ -522,6 +545,9 @@ async def run_classification(key: str, conv: str, instruction: str, context: str
         if route and reason == "continuation":
             stats["classifier_continuation"] += 1
             route = conv_last_tier(conv) or route  # a bare continuation keeps the conversation's tier
+        elif route == "routine" and ROUTINE_FLOOR and conv_last_tier(conv) in ("chat", "think"):
+            stats["classifier_floor"] += 1
+            route, reason = "chat", "floor"
         if route:
             stats["classifier_ok"] += 1
             cache_put(key, route)  # only real answers are cached, never fallbacks
@@ -545,7 +571,7 @@ async def route_request(messages: list, client_ip: str = "") -> dict:
          "input_chars": len(last_user)}
     if not last_user.strip():
         return d
-    if any(marker in last_user for marker in UNCLASSIFIED_CHAT_MARKERS):
+    if any(marker in last_user for marker in UNCLASSIFIED_CHAT_MARKERS) or last_user.lstrip().startswith(UNCLASSIFIED_CHAT_PREFIXES):
         return {**d, "tier": "chat", "src": "background"}
     if last_user.lstrip().startswith(TRUNCATION_MARKER) and TRUNCATION_TIER in TIERS:
         return {**d, "tier": TRUNCATION_TIER, "src": "rule", "reason": "truncation_continuation"}
@@ -588,7 +614,7 @@ async def route_request(messages: list, client_ip: str = "") -> dict:
     if route:
         if reason == "continuation":
             return {**d, "tier": route, "src": "inherit", "reason": "continuation", "classify_ms": ms}
-        return {**d, "tier": route, "src": "llm", "classify_ms": ms}
+        return {**d, "tier": route, "src": "llm", "reason": "floor" if reason == "floor" else None, "classify_ms": ms}
     stats[f"fallback_{reason}"] += 1
     return {**d, "tier": fallback, "src": "fallback", "reason": reason, "classify_ms": ms}
 
@@ -784,7 +810,7 @@ async def chat_completions(request: Request):
         d = await route_request(body.get("messages") or [], request.client.host if request.client else "")
         chosen = d["tier"]
         rec.update(conv=d["conv"], tier=chosen, route_src=d["src"], fallback_reason=d["reason"] if d["src"] == "fallback" else None,
-                   classify_ms=d["classify_ms"], input_chars=d["input_chars"], prompt=d["prompt"])
+                   route_reason=d["reason"] if d["src"] != "fallback" else None, classify_ms=d["classify_ms"], input_chars=d["input_chars"], prompt=d["prompt"])
         body["model"] = chosen
     else:
         rec.update(tier=model_req, route_src="explicit")
