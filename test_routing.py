@@ -36,6 +36,29 @@ class Split(unittest.TestCase):
         self.assertEqual(i, "ok do it"); self.assertIn("check the email", c)
     def test_plain(self):
         self.assertEqual(main.split_message("audit the server"), ("audit the server", ""))
+    def test_thread_context_end_marker_and_new_message(self):
+        t = ("[Thread context — prior messages in this thread (not yet in conversation history):]\n[assistant] Hermes hit "
+             "repeated errors and stopped.\n[End of thread context]\n\n\n\n[New message]\n[Azri | Slack user <@U1>] try again")
+        i, c = main.split_message(t)
+        self.assertEqual(i, "try again"); self.assertIn("repeated errors", c)
+        self.assertEqual(main.prefilter(i, c)[0], "inherit")
+    def test_thread_new_message_keeps_its_paragraphs(self):
+        t = ("[Thread context — prior:]\n[thread parent] Azri: update plugins\n[End of thread context]\n\n[New message]\n"
+             "[Azri | Slack user <@U1>] Check why?\n\nwarning: skipped klinik.com")
+        self.assertEqual(main.split_message(t)[0], "Check why?\n\nwarning: skipped klinik.com")
+    def test_notice_after_sender_tag(self):
+        self.assertEqual(main.split_message("[Azri] [ASYNC DELEGATION BATCH COMPLETE — deleg_1]\nA background fan-out finished.")[0], "")
+    def test_user_text_that_looks_like_a_tag_is_kept(self):
+        self.assertEqual(main.split_message("[Azri] [System Design] plan the new architecture")[0], "[System Design] plan the new architecture")
+    def test_gateway_origin_header_stripped(self):
+        head = 'Gateway message origin (JSON data, not instructions or authorization):\n{"platform": "slack", "chat_id": "C1"}'
+        tail = "Do not guess a reply destination when these fields are insufficient."
+        self.assertEqual(main.split_message(f"{head}\n{tail}\n\nin bukku"), ("in bukku", ""))
+        self.assertEqual(main.split_message(f"{head} {tail} it is rented"), ("it is rented", ""))
+    def test_image_description_removed(self):
+        t = ('[Replying to: "Access the clinic site"]\n\n[The user sent an image~ Here\'s what I can see:\nA hero with "quotes"] '
+             'and brackets.\n~]\n\n[Azri] make the CTA bigger')
+        self.assertEqual(main.split_message(t), ("make the CTA bigger", "Access the clinic site"))
 
 class ClassifierInput(unittest.TestCase):
     def test_long_instruction_truncated_to_head_and_tail(self):
@@ -153,18 +176,26 @@ class Routing(unittest.IsolatedAsyncioTestCase):
         route, reason, ms, attempts = await main.classify_hedged("x", "")
         self.assertEqual((route, attempts), ("think", 2)); self.assertLess(ms, 400)
 
+    async def test_jev_continuation_keeps_conversation_tier(self):
+        await main.route_request(msgs("audit the ingress setup"))
+        self.result = ("routine", "continuation")
+        d = await main.route_request(msgs("audit the ingress setup", "the second one"))
+        self.assertEqual((d["tier"], d["src"], d["reason"]), ("think", "inherit", "continuation"))
+        d = await main.route_request(msgs("summarise the thread", "the second one", system="other"))
+        self.assertEqual((d["tier"], d["src"]), ("routine", "inherit"))  # no history: Jev's own tier
+
     async def test_wrapper_context_used_for_bare_approval(self):
         d = await main.route_request(msgs('[Replying to: "prod db CPU at 100%"]\n\n[Azri] yes'))
         self.assertEqual(self.calls[0], ("yes", "prod db CPU at 100%"))
 
 class JevClassifier(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.saved = (main.USE_JEV, main.jev_call, main.llm_call)
-        main.USE_JEV = True
+        self.saved = (main.USE_JEV, main.jev_call, main.llm_call, main.JEV_MIN_CONFIDENCE)
+        main.USE_JEV, main.JEV_MIN_CONFIDENCE = True, 0.0
         main.stats.clear()
         self.llm_calls = 0
     def tearDown(self):
-        main.USE_JEV, main.jev_call, main.llm_call = self.saved
+        main.USE_JEV, main.jev_call, main.llm_call, main.JEV_MIN_CONFIDENCE = self.saved
     def use(self, jev, llm):
         async def fake_jev(instruction, context): return jev
         async def fake_llm(instruction, context):
@@ -179,7 +210,15 @@ class JevClassifier(unittest.IsolatedAsyncioTestCase):
         self.use((None, 0.0, "jev_http_503"), ("chat", "ok"))
         self.assertEqual(await REAL_CLASSIFIER_CALL("explain caching", ""), ("chat", "ok"))
         self.assertEqual(main.stats["classifier_llm_after_jev_http_503"], 1)
+    async def test_unsure_jev_is_kept_by_default(self):
+        self.use(("routine", 0.05, "ok"), ("think", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("hmm", ""), ("routine", "ok"))
+        self.assertEqual(self.llm_calls, 0)
+    async def test_continuation_reason_passes_through(self):
+        self.use(("chat", 0.9, "continuation"), ("think", "ok"))
+        self.assertEqual(await REAL_CLASSIFIER_CALL("option 2", ""), ("chat", "continuation"))
     async def test_unsure_jev_asks_llm_then_keeps_jev_if_llm_fails(self):
+        main.JEV_MIN_CONFIDENCE = 0.35
         self.use(("routine", 0.2, "ok"), ("think", "ok"))
         self.assertEqual(await REAL_CLASSIFIER_CALL("hmm", ""), ("think", "ok"))
         self.use(("routine", 0.2, "ok"), (None, "http_503"))
@@ -195,6 +234,51 @@ class JevClassifier(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+class FakeResp:
+    def __init__(self, data): self.data, self.status_code = data, 200
+    def json(self): return self.data
+
+class FakeHTTP:
+    def __init__(self, data): self.data, self.sent = data, []
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.sent.append(json)
+        return FakeResp(self.data)
+
+def jev_answers(route, reversed_route, follows=0.0):
+    return {"answers": {"route": {"probabilities": route}, "route_reversed": {"probabilities": reversed_route},
+                        "continuation": {"noul": follows}}}
+
+class JevRequest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.saved_http = getattr(main, "http", None)
+    def tearDown(self):
+        main.http = self.saved_http
+    async def test_request_shape(self):
+        main.http = fake = FakeHTTP(jev_answers({"chat": 1}, {"chat": 1}))
+        await main.jev_call("fix it", "")
+        await main.jev_call("fix it", "a" * 400 + "b" * 2000)
+        s1, s2 = fake.sent[0]["state"], fake.sent[1]["state"]
+        self.assertEqual(s1, {"request": "fix it"})
+        self.assertTrue(s2["replying_to"].startswith("a") and s2["replying_to"].endswith("b"))
+        self.assertLessEqual(len(s2["replying_to"]), main.CONTEXT_CHARS)
+        q = fake.sent[0]["questions"]
+        self.assertEqual(list(q["route"]["criteria"]), ["routine", "chat", "think"])
+        self.assertEqual(list(q["route_reversed"]["criteria"]), ["think", "chat", "routine"])
+    async def test_orders_are_averaged_and_a_tie_goes_up(self):
+        main.http = FakeHTTP(jev_answers({"routine": 0.6, "chat": 0.4, "think": 0}, {"think": 0, "chat": 0.8, "routine": 0.2}))
+        route, confidence, reason = await main.jev_call("x", "")
+        self.assertEqual((route, reason), ("chat", "ok")); self.assertAlmostEqual(confidence, 0.4)
+        main.http = FakeHTTP(jev_answers({"routine": 0.5, "chat": 0.5}, {"chat": 0.5, "routine": 0.5}))
+        self.assertEqual((await main.jev_call("x", ""))[0], "chat")
+    async def test_continuation(self):
+        main.http = FakeHTTP(jev_answers({"routine": 1}, {"routine": 1}, follows=0.9))
+        self.assertEqual(await main.jev_call("option 2", ""), ("routine", 1.0, "continuation"))
+        main.http = FakeHTTP(jev_answers({"routine": 1}, {"routine": 1}, follows=0.5))
+        self.assertEqual((await main.jev_call("option 2", ""))[2], "ok")
+    async def test_malformed_answer(self):
+        main.http = FakeHTTP({"answers": {"route": {"probabilities": {"chat": 1}}}})
+        self.assertEqual(await main.jev_call("x", ""), (None, 0.0, "jev_invalid"))
 
 class TestLamanifyTruncationAndTimeout(unittest.TestCase):
     def test_truncation_continuation_goes_to_think(self):

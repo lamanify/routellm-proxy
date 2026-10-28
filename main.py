@@ -8,13 +8,18 @@ from fastapi.responses import StreamingResponse, Response, JSONResponse
 UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://nexus.assistant.lamanify.com/v1").rstrip("/")
 NEXUS_KEY = os.environ.get("NEXUS_API_KEY", "")
 ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "CLD/cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast")
-# Primary classifier: Jev (TypeSafe decisions model) via OpenRouter's decisions endpoint. It returns one
-# typed label with a confidence; errors and low-confidence answers fall back to the ROUTER_MODEL LLM.
-# Without OPENROUTER_API_KEY the LLM classifier is used alone.
+# Primary classifier: Jev (TypeSafe decisions model) via OpenRouter's decisions endpoint. One request asks the
+# tier question twice with the options in opposite orders (Jev leans toward the first option, so the two answers
+# are averaged) and whether the message only continues the previous task. Jev errors fall back to the
+# ROUTER_MODEL LLM, and so do answers below JEV_MIN_CONFIDENCE (0 = never: on real Slack traffic Jev's unsure
+# answers were right more often than the LLM's). Without OPENROUTER_API_KEY the LLM classifier is used alone.
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.14")
 JEV_URL = os.environ.get("JEV_URL", "https://openrouter.ai/api/alpha/decisions")
-JEV_MIN_CONFIDENCE = float(os.environ.get("JEV_MIN_CONFIDENCE", "0.35"))
+JEV_MIN_CONFIDENCE = float(os.environ.get("JEV_MIN_CONFIDENCE", "0"))
+# A message Jev rates at least this likely to be a bare continuation ("ya", "option 2", a value the agent asked
+# for) keeps the conversation's last tier, like the prefilter's continuation words.
+JEV_CONTINUATION = float(os.environ.get("JEV_CONTINUATION", "0.7"))
 USE_JEV = bool(OPENROUTER_KEY) and os.environ.get("CLASSIFIER_BACKEND", "jev") == "jev"
 
 # Upstream sometimes accepts a streaming request and then sends nothing for minutes.
@@ -103,14 +108,68 @@ Judge by how much work the request implies, not by how short it is. A context li
 
 Return JSON: {"route": "routine"|"chat"|"think"}"""
 
-# The same tiers as a Jev Choice question (option name -> description).
-JEV_INSTRUCTIONS = ("How much work does the user's request imply? Judge by how much work it implies, not by how "
-                    "short it is. A context line, if present, is only the message being replied to.")
+# The same tiers as Jev questions. Jev reads literally, so each option says what it covers, what it does not
+# (naming the neighbouring tier) and gives examples, and the instructions name the state fields (TypeSafe's
+# guidance for Choice questions; "the user's own" yes/no because Jev read "a quick yes/no" as any yes/no
+# question). On 127 hand-labelled real Slack requests this design picked an acceptable tier for 96-98% across
+# runs (one-line criteria: 90%) and sent 2-4 tasks to a lower tier than they need (was 9).
+JEV_INSTRUCTIONS = {
+    "question": "How much work does the `request` ask the assistant to do?",
+    "focus": "Judge the work the request implies, not its length: a short request to change, fix, build or "
+             "investigate something is still work.",
+    "fields": "`request` is the user's new message. `replying_to`, if present, is the earlier conversation it "
+              "follows: use it only to understand what the request refers to.",
+}
 JEV_CRITERIA = {
-    "routine": "greetings, thanks, simple acknowledgments, pings, simple lookups of a link, status or fact",
-    "chat": "standard chat, explanations, copywriting, typical tasks",
-    "think": "audits, architecture, code debugging, disaster recovery plans, troubleshooting complex errors, and "
-             "requests to check, crawl, test or review many pages or systems or to carry out multi-step work",
+    "routine": {
+        "what": "No real work: greetings, thanks, acknowledgments, pings, the user's own short yes/no or scheduling "
+                "reply, or one simple lookup that returns a single link, status, date or fact (for example whether "
+                "a reply or email has arrived).",
+        "not_for": "Requests to change, add, remove, fix, write, draft, explain, analyse, plan or test anything, "
+                   "however short, and questions that ask for the assistant's judgment or ask it to try something.",
+        "examples": ["thanks, noted", "give me the staging link", "any reply from the client yet?",
+                     "is the site up now?", "ok terima kasih"],
+    },
+    "chat": {
+        "what": "One bounded task: answer a question or give an opinion, explain something, write or draft copy, a "
+                "post or an email, summarise, or make one specific edit such as changing a link, text, colour, "
+                "spacing, image or setting.",
+        "not_for": "Pure acknowledgments and one-fact lookups (routine). Finding out why something is broken or "
+                   "slow, audits, plans, building new pages or workflows, tests, or work across many pages or "
+                   "systems (think).",
+        "examples": ["redirect the hero button to WhatsApp", "draft a follow-up email to the client",
+                     "explain how this pricing works", "add more padding under the hero section",
+                     "tolong tukar warna butang jadi hijau"],
+    },
+    "think": {
+        "what": "Heavy or multi-step work: finding out why something is broken, wrong or slow and fixing it, audits "
+                "and reviews of many pages, sites or systems, strategy, architecture or project plans, building new "
+                "pages, sections, decks or workflows, running tests, or carrying out a multi-step plan.",
+        "not_for": "A single specific edit, draft, explanation or lookup, even if the message is long (chat or "
+                   "routine).",
+        "examples": ["why is the contact form not sending emails?", "audit all landing pages for SEO issues",
+                     "plan the migration of our client sites to the new server",
+                     "build a new pricing page from this brief", "kenapa page checkout error? check dan betulkan"],
+    },
+}
+JEV_QUESTIONS = {
+    "route": {"type": "choice", "instructions": JEV_INSTRUCTIONS, "criteria": JEV_CRITERIA},
+    "route_reversed": {"type": "choice", "instructions": JEV_INSTRUCTIONS,
+                       "criteria": dict(reversed(list(JEV_CRITERIA.items())))},
+    "continuation": {
+        "type": "noul",
+        "instructions": "Is the `request` only a short reply that lets the assistant carry on with its previous task, "
+                        "without asking for anything new?",
+        "criteria": {
+            "true": {"what": "A bare go-ahead, answer or piece of data the assistant asked for: yes, ok, done, try "
+                             "again, a choice between offered options, or a value, name, ID or link given with no "
+                             "instruction of its own.",
+                     "examples": ["ya", "option 2", "done", "go ahead", "the account is under Lamanify", "the second one"]},
+            "false": {"what": "A message that asks for something itself: a new task, a question, a correction or a "
+                              "change, even a very short one.",
+                      "examples": ["give me the link", "remove the banner", "why is it slow?", "draft the email first"]},
+        },
+    },
 }
 
 HOP_BY_HOP = {
@@ -135,7 +194,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
         await http.aclose()
 
-app = FastAPI(title="RouteLLM Proxy", version="1.6.0", lifespan=lifespan)
+app = FastAPI(title="RouteLLM Proxy", version="1.7.0", lifespan=lifespan)
 
 def clean_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
@@ -209,16 +268,25 @@ SYSTEM_NOTE_RE = re.compile(r"\[System note.*?(?:\n\s*\n|\Z)", re.S | re.I)
 NOTICE_RE = re.compile(
     r"^\s*\[(?:System\b|ASYNC DELEGATION|CONTEXT COMPACTION|STILL IN PROGRESS|Context from the interrupted"
     r"|[^\]\n]{0,60}\b(?:tool[- ]iteration|iteration (?:limit|budget)|max(?:imum)? iterations))", re.I)
+# Agent notices that Hermes can prefix with a sender tag ("[Azri] [ASYNC DELEGATION ..."). Narrower than
+# NOTICE_RE because it is also tried on the user's own words.
+AGENT_NOTICE_RE = re.compile(r"^\s*\[(?:ASYNC DELEGATION|CONTEXT COMPACTION|STILL IN PROGRESS|Context from the interrupted)", re.I)
+# Not the user's words either: the gateway's origin header (one JSON line for the agent) and the vision
+# preprocessor's image descriptions (up to thousands of characters, placed before the user's text).
+GATEWAY_RE = re.compile(r"Gateway message origin \(JSON data[^\n]*\n\s*\{[^{}\n]*\}[ \t]*\n?(?:[ \t]*Do not guess a reply destination[^.\n]*\.)?")
+IMAGE_RE = re.compile(r"\[The user sent an image~ Here's what I can see:.*?~\]", re.S)
 REPLY_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>.*)$', re.S)
 REPLY_WITH_SENDER_RE = re.compile(r'^\s*\[Replying to:\s*"(?P<ctx>.*?)"\]\s*(?P<rest>\[[^\]\n]{1,80}\].*)$', re.S)
 SENDER_RE = re.compile(r"^\s*\[[^\]\n|]{1,60}(?:\s*\|\s*Slack user\s*<@\w+>)?\]\s*")
 OOB_RE = re.compile(r"^\s*\[OUT-OF-BAND USER MESSAGE")
 THREAD_RE = re.compile(r"^\s*\[Thread context\b[^\]\n]*\]\s*", re.I)
+THREAD_END = "[End of thread context]"
+NEW_MESSAGE_RE = re.compile(r"^\s*\[New message\]\s*")
 
 def split_message(text: str) -> tuple[str, str]:
     """Return (instruction, context). instruction == "" means the message carries no new request."""
-    text = MEMORY_RE.sub("", text)
-    if NOTICE_RE.match(text):
+    text = IMAGE_RE.sub("", GATEWAY_RE.sub("", MEMORY_RE.sub("", text))).strip()
+    if NOTICE_RE.match(text) or AGENT_NOTICE_RE.match(SENDER_RE.sub("", text, count=1)):
         return "", ""
     text = SYSTEM_NOTE_RE.sub("", text).strip()
     context = ""
@@ -228,12 +296,19 @@ def split_message(text: str) -> tuple[str, str]:
             lines.pop(0)
         text = "\n".join(lines).strip()
     elif THREAD_RE.match(text):
-        parts = THREAD_RE.sub("", text, count=1).split("\n\n")
-        text, context = (parts[-1], "\n\n".join(parts[:-1])) if len(parts) > 1 else ("", "")
+        body = THREAD_RE.sub("", text, count=1)
+        if THREAD_END in body:  # "...[End of thread context]\n\n[New message]\n[Azri | Slack user <@U…>] text"
+            context, text = body.split(THREAD_END, 1)
+        else:
+            parts = body.split("\n\n")
+            text, context = (parts[-1], "\n\n".join(parts[:-1])) if len(parts) > 1 else ("", "")
     m = REPLY_WITH_SENDER_RE.match(text) or REPLY_RE.match(text)
     if m:
         context, text = m.group("ctx"), m.group("rest")
-    return SENDER_RE.sub("", text, count=1).strip(), context.strip()
+    instruction = SENDER_RE.sub("", NEW_MESSAGE_RE.sub("", text), count=1).strip()
+    if AGENT_NOTICE_RE.match(instruction):
+        return "", ""
+    return instruction, context.strip()
 
 # --- rule-based prefilter (obvious cases, no LLM call) ---
 SOCIAL_RE = re.compile(
@@ -308,23 +383,34 @@ def cache_put(key: str, tier: str):
 # LLM classifier
 # ---------------------------------------------------------------------------
 
-def classifier_input(instruction: str, context: str) -> str:
+def cap_instruction(instruction: str) -> str:
     if len(instruction) > INSTRUCTION_CHARS:
         head = INSTRUCTION_CHARS * 2 // 3
         instruction = instruction[:head] + " ... " + instruction[-(INSTRUCTION_CHARS - head):]
-    text = f"Query: {instruction}"
+    return instruction
+
+def classifier_input(instruction: str, context: str) -> str:
+    text = f"Query: {cap_instruction(instruction)}"
     if context:
         text += f"\nContext (the message being replied to): {context[:CONTEXT_CHARS]}"
     return text
 
+def jev_state(instruction: str, context: str) -> dict:
+    """Jev's state as named fields; a long context keeps its start (the thread's topic) and its end (the last turn)."""
+    state = {"request": cap_instruction(instruction)}
+    if context:
+        head = CONTEXT_CHARS * 3 // 5
+        state["replying_to"] = context if len(context) <= CONTEXT_CHARS else (
+            context[:head] + " ... " + context[-(CONTEXT_CHARS - head - 5):])
+    return state
+
 async def jev_call(instruction: str, context: str) -> tuple[str | None, float, str]:
-    """One Jev decision. Returns (route, confidence, "ok") or (None, 0.0, reason)."""
+    """One Jev request. Returns (route, confidence, "ok" or "continuation") or (None, 0.0, reason)."""
     try:
         resp = await http.post(
             JEV_URL,
             headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"},
-            json={"model": JEV_MODEL, "state": classifier_input(instruction, context),
-                  "questions": {"route": {"type": "choice", "instructions": JEV_INSTRUCTIONS, "criteria": JEV_CRITERIA}}},
+            json={"model": JEV_MODEL, "state": jev_state(instruction, context), "questions": JEV_QUESTIONS},
             timeout=CLASSIFIER_TIMEOUT,
         )
     except httpx.TimeoutException:
@@ -334,21 +420,28 @@ async def jev_call(instruction: str, context: str) -> tuple[str | None, float, s
     if resp.status_code != 200:
         return None, 0.0, f"jev_http_{resp.status_code}"
     try:
-        answer = resp.json()["answers"]["route"]
-        route, confidence = str(answer["choice"]).lower().strip(), float(answer.get("confidence") or 0.0)
-    except (ValueError, KeyError, TypeError):
+        answers = resp.json()["answers"]
+        ps = [answers[q]["probabilities"] for q in ("route", "route_reversed")]
+        probs = {t: sum(float(p.get(t) or 0.0) for p in ps) / len(ps) for t in TIERS}
+        follows = float((answers.get("continuation") or {}).get("noul") or 0.0)
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None, 0.0, "jev_invalid"
-    return (route, confidence, "ok") if route in TIERS else (None, 0.0, "jev_invalid_route")
+    route = max(TIERS, key=lambda t: (probs[t], TIERS.index(t)))  # a tie goes to the higher tier
+    if probs[route] <= 0:
+        return None, 0.0, "jev_invalid_route"
+    confidence = (probs[route] - 1 / len(TIERS)) / (1 - 1 / len(TIERS))  # TypeSafe's Choice confidence
+    return route, confidence, "continuation" if follows >= JEV_CONTINUATION else "ok"
 
 async def classifier_call(instruction: str, context: str) -> tuple[str | None, str]:
     """One classification: Jev first when configured; the LLM classifier answers when Jev fails or is unsure
-    (confidence below JEV_MIN_CONFIDENCE). An unsure Jev answer still beats no answer."""
+    (confidence below JEV_MIN_CONFIDENCE). An unsure Jev answer still beats no answer. The reason is "ok", or
+    "continuation" when Jev says the message only continues the previous task."""
     if not USE_JEV:
         return await llm_call(instruction, context)
     route, confidence, reason = await jev_call(instruction, context)
     if route and confidence >= JEV_MIN_CONFIDENCE:
         stats["classifier_jev"] += 1
-        return route, "ok"
+        return route, reason
     llm_route, llm_reason = await llm_call(instruction, context)
     if llm_route:
         stats["classifier_llm_after_" + ("jev_unsure" if route else reason)] += 1
@@ -411,7 +504,7 @@ async def classify_hedged(instruction: str, context: str) -> tuple[str | None, s
                 tasks.discard(task)
                 route, reason = task.result()
                 if route:
-                    return route, "ok", ms_since(t0), attempts
+                    return route, reason, ms_since(t0), attempts
                 last_reason = reason
             if can_hedge and (not done and time.time() >= t0 + CLASSIFIER_HEDGE - 0.01 or not tasks):
                 can_hedge = False  # one extra attempt: on the hedge timer, or at once if the first one failed
@@ -426,6 +519,9 @@ async def run_classification(key: str, conv: str, instruction: str, context: str
     """Classify and record the outcome. Runs as a task so it finishes even if the request stopped waiting."""
     try:
         route, reason, ms, attempts = await classify_hedged(instruction, context)
+        if route and reason == "continuation":
+            stats["classifier_continuation"] += 1
+            route = conv_last_tier(conv) or route  # a bare continuation keeps the conversation's tier
         if route:
             stats["classifier_ok"] += 1
             cache_put(key, route)  # only real answers are cached, never fallbacks
@@ -490,6 +586,8 @@ async def route_request(messages: list, client_ip: str = "") -> dict:
     except Exception as e:  # classification task crashed: treat as a failed classification
         route, reason, ms = None, f"error_{type(e).__name__}", 0.0
     if route:
+        if reason == "continuation":
+            return {**d, "tier": route, "src": "inherit", "reason": "continuation", "classify_ms": ms}
         return {**d, "tier": route, "src": "llm", "classify_ms": ms}
     stats[f"fallback_{reason}"] += 1
     return {**d, "tier": fallback, "src": "fallback", "reason": reason, "classify_ms": ms}
